@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import re
+import csv
 import time
 from collections import Counter
 from multiprocessing import Pool, cpu_count
@@ -279,7 +280,7 @@ def main(business_path, review_path):
         n_proc=max(1, cpu_count() - 1)
     )
 
-    write_jsonl("餐厅整体评论数据_并行.jsonl", merged_rows)
+    write_jsonl("餐厅整体评论数据_parallel.jsonl", merged_rows)
 
     print(f"[Total] 总运行时间: {time.time() - start:.2f} 秒")
 
