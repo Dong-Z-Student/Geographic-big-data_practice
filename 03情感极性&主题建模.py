@@ -31,6 +31,10 @@ from gensim.models import LdaMulticore
 # =========================
 TEXT_FIELD = "text_clean"   # 按你的要求写死
 
+LDA_EXTRA_STOPWORDS = {
+    "good", "great", "just", "really", "nice","best",
+    "love", "like", "amazing", "pretty","don","didn","ve","did"
+}
 
 # =========================
 # 读写工具
@@ -82,11 +86,16 @@ def save_topic_words_json(path: str, topic_words: Dict[int, List[Tuple[str, floa
 
 def tokenize_for_lda(text: str) -> List[str]:
     """
-    你的 text_clean 已经做过基础清洗，这里直接空格切分即可。
+    text_clean 已预处理，这里仅做：
+    - 空格切分
+    - 移除 LDA 专用情感泛化词（不影响 TextBlob）
     """
     if not text:
         return []
-    return [t for t in text.split() if t]
+    return [
+        t for t in text.split()
+        if t and t not in LDA_EXTRA_STOPWORDS
+    ]
 
 
 def extract_category_columns(sample_record: Dict[str, Any], prefix: str = "cat__") -> List[str]:
