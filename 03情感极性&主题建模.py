@@ -337,7 +337,7 @@ def main():
     KEEP_N = 30000
     MAX_DOCS_CAP = 0       # 0=不限制；>0 可限制训练文档数（防内存吃紧）
 
-    INFER_BATCH_SIZE = 2000
+    INFER_BATCH_SIZE = 100000
 
     # ===== 读取一条样本确定 cat__ 字段列表 =====
     sample = next(iter_json_lines(INPUT_MERGED_JSON))
