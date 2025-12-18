@@ -401,12 +401,12 @@ def main():
     OUT_FEATURES_JSON = "restaurant_features.json"  # 按行JSON（扩展名用 .json）
 
     # OUT_TOPIC_WORDS_TXT = "lda_topic_words.txt"
-    OUT_TOPIC_WORDS_JSON = "lda_topic_words.json"
+    OUT_TOPIC_WORDS_JSON = "lda_topic_words_3类_5轮_1.0.json"
 
     # ===== 可调参数 =====
     TRAIN_RATIO = 1.0      # 1.0=100%；0.2=20%（随机抽样）
     SEED = 42
-    NUM_TOPICS = 5
+    NUM_TOPICS = 3
     TOPN_WORDS = 15
 
     PASSES = 5
@@ -459,6 +459,7 @@ def main():
     save_topic_words_json(OUT_TOPIC_WORDS_JSON, topic_words)
     print(f"[INFO] topic words saved: {OUT_TOPIC_WORDS_JSON}")
 
+    """
     # ===== 4) 第二遍扫描（并行）：情感 + 主题 → 餐厅级聚合 =====
     t2 = time.time()
     restaurant_rows = build_restaurant_level_dataset_parallel(
@@ -471,14 +472,14 @@ def main():
     )
     print(f"[TIME] build restaurant features: {time.time() - t2:.1f}s")
 
-    """
+    
     # ===== 5) 可选输出（你可在 main 中注释掉以减少运行时间）=====
     base_fields = ["business_id", "price_range", "stars", "review_count", "latitude", "longitude"]
     out_fields = base_fields + category_cols + [
         "avg_sentiment_polarity", "avg_sentiment_subjectivity"
     ] + [f"topic_{i}" for i in range(NUM_TOPICS)]
     write_csv(OUT_FEATURES_CSV, restaurant_rows, out_fields)
-    """
+    
 
     # 保存按行 JSON（扩展名用 .json）
     write_json_lines(OUT_FEATURES_JSON, restaurant_rows)
@@ -487,7 +488,7 @@ def main():
     print(f"[OUTPUT] {OUT_FEATURES_JSON}")
     print("[DONE] all finished.")
     print(f"[Total] 总运行时间: {time.time() - start:.2f} 秒")
-
+    """
 
 if __name__ == "__main__":
     main()
