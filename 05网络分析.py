@@ -16,7 +16,8 @@ MODIFIED (per user requirements):
    - If error indicates "Found no graph nodes within the requested polygon", skip tile immediately (no retries)
 3) Keep all other functionality unchanged
 
-:contentReference[oaicite:0]{index=0}
+NEW (per user request):
+4) Persist the processed walk graph locally (GraphML). If local file exists, load it directly and skip tile download.
 """
 
 import os
@@ -41,7 +42,7 @@ warnings.filterwarnings("ignore")
 # User Config
 # =========================
 INPUT_json = r"restaurant_features.json"   # TODO: 改成你的输入文件（JSON Lines）
-OUTPUT_json = r"restaurants_stage1_walk_scores3.json"  # 输出（JSON Lines）
+OUTPUT_json = r"restaurants_stage1_walk_scores4.json"  # 输出（JSON Lines）
 
 PLACE_NAME = "Philadelphia, Pennsylvania, USA"
 
@@ -73,6 +74,10 @@ OVERPASS_ENDPOINTS = [
 
 # 并行线程数（按 unique origin node）
 MAX_WORKERS = max(1, (os.cpu_count() or 4) - 1)
+
+# ===== NEW: 本地路网持久化（最终处理后的 G：已投影 + 已裁剪）=====
+LOCAL_GRAPH_DIR = "./local_graph"
+LOCAL_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipped_utm18.graphml")
 
 
 # =========================
@@ -225,6 +230,41 @@ def build_cat_bitmask(df: pd.DataFrame, cat_cols: List[str]) -> np.ndarray:
     return masks
 
 
+# ===== NEW: GraphML 本地加载/保存 =====
+def load_graph_if_exists(graphml_path: str) -> nx.MultiDiGraph:
+    """
+    若本地 graphml 存在，则直接读取并返回；否则返回 None
+    """
+    if graphml_path and os.path.exists(graphml_path):
+        print(f"[INFO] Local graph found, loading: {graphml_path}")
+        G_local = ox.load_graphml(graphml_path)
+
+        # 兼容：GraphML 可能把节点ID读成 str，这里尽量转回 int（不影响其它功能）
+        try:
+            any_node = next(iter(G_local.nodes))
+            if isinstance(any_node, str) and any_node.isdigit():
+                mapping = {n: int(n) for n in G_local.nodes if isinstance(n, str) and n.isdigit()}
+                if len(mapping) == len(G_local.nodes):
+                    G_local = nx.relabel_nodes(G_local, mapping, copy=True)
+        except Exception:
+            pass
+
+        print(f"[INFO] loaded local graph: nodes={len(G_local.nodes):,}, edges={len(G_local.edges):,}")
+        return G_local
+    return None
+
+
+def save_graph_local(G: nx.MultiDiGraph, graphml_path: str):
+    """
+    将最终路网保存为 graphml
+    """
+    if not graphml_path:
+        return
+    os.makedirs(os.path.dirname(graphml_path), exist_ok=True)
+    ox.save_graphml(G, filepath=graphml_path)
+    print(f"[INFO] saved local graph: {graphml_path}")
+
+
 # =========================
 # Main
 # =========================
@@ -254,33 +294,42 @@ def main():
     place_utm = place_gdf.to_crs(TARGET_CRS)
     place_poly_utm = unary_union(place_utm.geometry.values)
 
-    print("[3] Generate tiles over polygon (UTM)")
-    tiles_utm = polygon_to_tiles(place_poly_utm, TILE_SIZE_M, TILE_BUFFER_M)
+    # ===== NEW: 优先从本地加载已经“投影+裁剪”的最终路网 =====
+    G = load_graph_if_exists(LOCAL_GRAPHML_PATH)
 
-    print("[4] Download walk network by tiles (Overpass) and merge")
-    graphs = []
-    for i, tile_utm in enumerate(tiles_utm, start=1):
-        print(f"  - tile {i}/{len(tiles_utm)}: download walk network")
-        tile_wgs = gpd.GeoSeries([tile_utm], crs=TARGET_CRS).to_crs("EPSG:4326").iloc[0]
-        try:
-            Gi = try_download_graph_from_polygon(tile_wgs, network_type="walk")
-            if Gi is None or len(Gi.nodes) == 0:
-                print(f"    [WARN] empty graph, skipped.")
-                continue
-            graphs.append(Gi)
-            print(f"    nodes={len(Gi.nodes):,}, edges={len(Gi.edges):,}")
-        except Exception as e:
-            print(f"    [ERROR] tile failed, skipped: {e}")
+    if G is None:
+        print("[3] Generate tiles over polygon (UTM)")
+        tiles_utm = polygon_to_tiles(place_poly_utm, TILE_SIZE_M, TILE_BUFFER_M)
 
-    G = merge_graphs(graphs)
-    print(f"[INFO] merged graph: nodes={len(G.nodes):,}, edges={len(G.edges):,}")
+        print("[4] Download walk network by tiles (Overpass) and merge")
+        graphs = []
+        for i, tile_utm in enumerate(tiles_utm, start=1):
+            print(f"  - tile {i}/{len(tiles_utm)}: download walk network")
+            tile_wgs = gpd.GeoSeries([tile_utm], crs=TARGET_CRS).to_crs("EPSG:4326").iloc[0]
+            try:
+                Gi = try_download_graph_from_polygon(tile_wgs, network_type="walk")
+                if Gi is None or len(Gi.nodes) == 0:
+                    print(f"    [WARN] empty graph, skipped.")
+                    continue
+                graphs.append(Gi)
+                print(f"    nodes={len(Gi.nodes):,}, edges={len(Gi.edges):,}")
+            except Exception as e:
+                print(f"    [ERROR] tile failed, skipped: {e}")
 
-    print("[5] Project graph to UTM 18N")
-    G = ox.project_graph(G, to_crs=TARGET_CRS)
+        G = merge_graphs(graphs)
+        print(f"[INFO] merged graph: nodes={len(G.nodes):,}, edges={len(G.edges):,}")
 
-    print("[5.5] Clip merged graph to Philadelphia boundary polygon (UTM)")
-    G = ox.truncate.truncate_graph_polygon(G, place_poly_utm, truncate_by_edge=True)
-    print(f"[INFO] clipped graph: nodes={len(G.nodes):,}, edges={len(G.edges):,}")
+        print("[5] Project graph to UTM 18N")
+        G = ox.project_graph(G, to_crs=TARGET_CRS)
+
+        print("[5.5] Clip merged graph to Philadelphia boundary polygon (UTM)")
+        G = ox.truncate.truncate_graph_polygon(G, place_poly_utm, truncate_by_edge=True)
+        print(f"[INFO] clipped graph: nodes={len(G.nodes):,}, edges={len(G.edges):,}")
+
+        # NEW: 保存最终路网到本地（下次直接加载）
+        save_graph_local(G, LOCAL_GRAPHML_PATH)
+    else:
+        print("[INFO] using local graph directly (skip download/merge/project/clip)")
 
     print("[6] Add walking travel_time to edges")
     add_walk_time_to_edges(G, WALK_SPEED_KMH)
@@ -300,14 +349,13 @@ def main():
         node_to_rest_idx.setdefault(int(n), []).append(idx)
 
     # 预取 node 坐标，给 isochrone bbox 用（投影后 G.nodes[u]['x'/'y'] 是米）
-    # 这里做一次 dict 查表，后续不再 graph_to_gdfs
     node_x: Dict[int, float] = {}
     node_y: Dict[int, float] = {}
     for n, data in G.nodes(data=True):
         node_x[int(n)] = float(data.get("x", np.nan))
         node_y[int(n)] = float(data.get("y", np.nan))
 
-    # ===== 修复：不要用 STRtree + id 映射（会出现 KeyError），改用 GeoPandas sindex 直接返回行索引 =====
+    # sindex 直接返回行索引（不会有 STRtree id 不一致问题）
     rest_sindex = rest_utm.sindex
 
     walkability = np.zeros(len(rest_utm), dtype=np.int32)
@@ -316,12 +364,6 @@ def main():
     print("[8] Compute walkability_score and competitor_density (10-min walk isochrone) by unique origin nodes (parallel)")
 
     def process_one_origin(origin_node: int, origin_rest_indices: List[int]) -> Tuple[int, int, Dict[int, int]]:
-        """
-        返回:
-          origin_node,
-          walkability_score_for_this_node,
-          competitor_counts_for_origin_restaurants: {rest_idx: competitor_count}
-        """
         dist_map = compute_isochrone_dists(G, origin_node, WALK_TIME_SECONDS)
         if not dist_map:
             return origin_node, 0, {ri: 0 for ri in origin_rest_indices}
@@ -344,14 +386,11 @@ def main():
 
         minx, maxx = min(xs_), max(xs_)
         miny, maxy = min(ys_), max(ys_)
-        # 给 bbox 略微加一点缓冲，避免边缘点漏掉（与 tile buffer 一致）
         pad = float(TILE_BUFFER_M)
         bbox = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
 
-        # ===== 修复点：sindex 直接给候选“行索引”，不会出现 STRtree id 不一致 KeyError =====
         cand_idx = list(rest_sindex.intersection(bbox.bounds))
 
-        # 精过滤：餐厅节点是否在 dist_map 内（bitmask 判断只在 candidates 上做）
         reachable_set = []
         for j in cand_idx:
             nj = int(rest_nodes[j])
@@ -361,7 +400,6 @@ def main():
         if not reachable_set:
             return origin_node, w_score, {ri: 0 for ri in origin_rest_indices}
 
-        # 对 origin node 上的每家餐厅，统计 reachable_set 内的 competitor
         comp_counts: Dict[int, int] = {}
         for i in origin_rest_indices:
             my_mask = cat_masks[i]
@@ -378,7 +416,6 @@ def main():
 
         return origin_node, w_score, comp_counts
 
-    # 并行按 unique origin node
     futures = []
     done_nodes = 0
     total_nodes = len(node_to_rest_idx)
@@ -390,11 +427,9 @@ def main():
         for fut in as_completed(futures):
             origin_node, w_score, comp_counts = fut.result()
 
-            # 回填：该 node 下所有餐厅 walkability 相同
             for ri in node_to_rest_idx.get(int(origin_node), []):
                 walkability[ri] = int(w_score)
 
-            # 回填 competitor（仅对该 node 下餐厅）
             for ri, c in comp_counts.items():
                 competitor[int(ri)] = int(c)
 
@@ -417,6 +452,7 @@ def main():
 
     end_time = time.time()
     print(f"\n总运行时间：{end_time - start_time:.2f} 秒")
+
 
 if __name__ == "__main__":
     main()
