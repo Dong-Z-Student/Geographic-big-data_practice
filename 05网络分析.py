@@ -5,20 +5,25 @@ Outputs: walkability_score, competitor_density
 - Auto-fetch Philadelphia polygon from OSM (Nominatim)
 - Download walk network by tiles (polygon clipped) to avoid Overpass connection reset
 - Project to UTM 18N (EPSG:32618)
-- For each restaurant: nearest node -> 10-min isochrone (600s) -> node count + competitor count
+- Compute per-unique origin node isochrone once, reuse for all restaurants snapped to that node
+- Collect candidate restaurant indices per isochrone, then use bitmask checks (no repeated graph range lookups)
 
-MODIFIED:
-- Removed primary_cat_col completely
-- Competitor definition:
-  Two restaurants are competitors if they share ANY cat__*** column where both == 1
+MODIFIED (per user requirements):
+1) Parallelize computation of walkability_score & competitor_density using unique origin nodes:
+   - Each unique node computes isochrone once
+   - Collect candidates once, then restaurant-level checks via bitmask
+2) Remove meaningless retry when polygon has no graph nodes:
+   - If error indicates "Found no graph nodes within the requested polygon", skip tile immediately (no retries)
+3) Keep all other functionality unchanged
 
-Author: ChatGPT
+:contentReference[oaicite:0]{index=0}
 """
 
 import os
 import time
 import warnings
-from typing import List, Dict
+from typing import List, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -36,7 +41,7 @@ warnings.filterwarnings("ignore")
 # User Config
 # =========================
 INPUT_json = r"restaurant_features.json"   # TODO: 改成你的输入文件（JSON Lines）
-OUTPUT_json = r"restaurants_stage1_walk_scores.json"  # 输出（JSON Lines）
+OUTPUT_json = r"restaurants_stage1_walk_scores3.json"  # 输出（JSON Lines）
 
 PLACE_NAME = "Philadelphia, Pennsylvania, USA"
 
@@ -65,6 +70,9 @@ OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
+
+# 并行线程数（按 unique origin node）
+MAX_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 
 
 # =========================
@@ -125,9 +133,15 @@ def polygon_to_tiles(poly_utm, tile_size_m: float, buffer_m: float) -> List:
     return cleaned
 
 
+def _is_no_nodes_polygon_error(e: Exception) -> bool:
+    msg = str(e) if e is not None else ""
+    return "Found no graph nodes within the requested polygon" in msg
+
+
 def try_download_graph_from_polygon(poly_wgs84, network_type="walk") -> nx.MultiDiGraph:
     """
     带重试 + 切换 overpass endpoint 的下载函数
+    - 若遇到“polygon内无节点”，直接返回 None（不重试，不换endpoint）
     """
     last_err = None
     for ep in OVERPASS_ENDPOINTS:
@@ -143,10 +157,16 @@ def try_download_graph_from_polygon(poly_wgs84, network_type="walk") -> nx.Multi
                 )
                 return G
             except Exception as e:
+                # 关键改动：无节点 => 直接退出（不重试）
+                if _is_no_nodes_polygon_error(e):
+                    print(f"[WARN] tile has no graph nodes, skipped immediately: {e}")
+                    return None
+
                 last_err = e
                 wait = BACKOFF_SECONDS * (k + 1)
                 print(f"[WARN] download failed (endpoint={ep}, retry={k+1}/{RETRIES}): {e}")
                 time.sleep(wait)
+
     raise RuntimeError(f"All retries failed downloading graph. Last error: {last_err}")
 
 
@@ -175,11 +195,13 @@ def build_rest_gdf(df: pd.DataFrame, crs="EPSG:4326") -> gpd.GeoDataFrame:
     )
 
 
-def compute_isochrone_nodes(G: nx.MultiDiGraph, origin_node: int, max_time_s: float) -> List[int]:
-    lengths = nx.single_source_dijkstra_path_length(
+def compute_isochrone_dists(G: nx.MultiDiGraph, origin_node: int, max_time_s: float) -> Dict[int, float]:
+    """
+    返回: 可达节点 -> travel_time
+    """
+    return nx.single_source_dijkstra_path_length(
         G, origin_node, cutoff=max_time_s, weight="travel_time"
     )
-    return list(lengths.keys())
 
 
 def build_cat_bitmask(df: pd.DataFrame, cat_cols: List[str]) -> np.ndarray:
@@ -190,15 +212,12 @@ def build_cat_bitmask(df: pd.DataFrame, cat_cols: List[str]) -> np.ndarray:
     if not cat_cols:
         return np.zeros(len(df), dtype=object)
 
-    # 确保是 0/1
     mat = df[cat_cols].fillna(0).astype(np.int8).to_numpy()
     masks = np.empty(mat.shape[0], dtype=object)
 
     for i in range(mat.shape[0]):
         m = 0
         row = mat[i]
-        # 把为1的列置位
-        # 91列很小，这个循环非常快
         for bit, val in enumerate(row):
             if val:
                 m |= (1 << bit)
@@ -206,7 +225,12 @@ def build_cat_bitmask(df: pd.DataFrame, cat_cols: List[str]) -> np.ndarray:
     return masks
 
 
+# =========================
+# Main
+# =========================
 def main():
+    start_time = time.time()
+
     configure_osmnx()
 
     print("[1] Load restaurant data")
@@ -220,7 +244,7 @@ def main():
     cat_cols = [c for c in df.columns if c.startswith("cat__")]
     print(f"[INFO] category columns: {len(cat_cols)}")
 
-    # 为 competitor 判定准备 bitmask（核心改动）
+    # competitor 判定 bitmask
     cat_masks = build_cat_bitmask(df, cat_cols)
 
     rest_gdf = build_rest_gdf(df, crs="EPSG:4326")
@@ -240,6 +264,9 @@ def main():
         tile_wgs = gpd.GeoSeries([tile_utm], crs=TARGET_CRS).to_crs("EPSG:4326").iloc[0]
         try:
             Gi = try_download_graph_from_polygon(tile_wgs, network_type="walk")
+            if Gi is None or len(Gi.nodes) == 0:
+                print(f"    [WARN] empty graph, skipped.")
+                continue
             graphs.append(Gi)
             print(f"    nodes={len(Gi.nodes):,}, edges={len(Gi.edges):,}")
         except Exception as e:
@@ -263,40 +290,117 @@ def main():
     print("[7] Snap restaurants to nearest network nodes")
     xs = rest_utm.geometry.x.to_numpy()
     ys = rest_utm.geometry.y.to_numpy()
-    rest_nodes = ox.distance.nearest_nodes(G, X=xs, Y=ys)
+    rest_nodes = np.asarray(ox.distance.nearest_nodes(G, X=xs, Y=ys), dtype=np.int64)
 
     rest_utm["__node__"] = rest_nodes
 
-    # 把“哪些餐厅落在哪个节点”先聚合起来
+    # node -> restaurant indices
     node_to_rest_idx: Dict[int, List[int]] = {}
     for idx, n in enumerate(rest_nodes):
         node_to_rest_idx.setdefault(int(n), []).append(idx)
 
-    walkability = np.zeros(len(rest_utm), dtype=int)
-    competitor = np.zeros(len(rest_utm), dtype=int)
+    # 预取 node 坐标，给 isochrone bbox 用（投影后 G.nodes[u]['x'/'y'] 是米）
+    # 这里做一次 dict 查表，后续不再 graph_to_gdfs
+    node_x: Dict[int, float] = {}
+    node_y: Dict[int, float] = {}
+    for n, data in G.nodes(data=True):
+        node_x[int(n)] = float(data.get("x", np.nan))
+        node_y[int(n)] = float(data.get("y", np.nan))
 
-    print("[8] Compute walkability_score and competitor_density (10-min walk isochrone)")
-    for i in range(len(rest_utm)):
-        origin = int(rest_nodes[i])
-        iso_nodes = compute_isochrone_nodes(G, origin, WALK_TIME_SECONDS)
-        walkability[i] = len(iso_nodes)
+    # ===== 修复：不要用 STRtree + id 映射（会出现 KeyError），改用 GeoPandas sindex 直接返回行索引 =====
+    rest_sindex = rest_utm.sindex
 
-        # competitor: 统计等时圈内“与我共享任意 cat__***==1 的其他餐厅数量”
-        my_mask = cat_masks[i]
-        if not my_mask:
-            competitor[i] = 0
-        else:
+    walkability = np.zeros(len(rest_utm), dtype=np.int32)
+    competitor = np.zeros(len(rest_utm), dtype=np.int32)
+
+    print("[8] Compute walkability_score and competitor_density (10-min walk isochrone) by unique origin nodes (parallel)")
+
+    def process_one_origin(origin_node: int, origin_rest_indices: List[int]) -> Tuple[int, int, Dict[int, int]]:
+        """
+        返回:
+          origin_node,
+          walkability_score_for_this_node,
+          competitor_counts_for_origin_restaurants: {rest_idx: competitor_count}
+        """
+        dist_map = compute_isochrone_dists(G, origin_node, WALK_TIME_SECONDS)
+        if not dist_map:
+            return origin_node, 0, {ri: 0 for ri in origin_rest_indices}
+
+        iso_nodes = list(dist_map.keys())
+        w_score = len(iso_nodes)
+
+        # bbox for candidates (min/max of reachable node coords)
+        xs_ = []
+        ys_ = []
+        for n in iso_nodes:
+            x_ = node_x.get(int(n), None)
+            y_ = node_y.get(int(n), None)
+            if x_ is not None and y_ is not None:
+                if not (np.isnan(x_) or np.isnan(y_)):
+                    xs_.append(x_)
+                    ys_.append(y_)
+        if not xs_:
+            return origin_node, w_score, {ri: 0 for ri in origin_rest_indices}
+
+        minx, maxx = min(xs_), max(xs_)
+        miny, maxy = min(ys_), max(ys_)
+        # 给 bbox 略微加一点缓冲，避免边缘点漏掉（与 tile buffer 一致）
+        pad = float(TILE_BUFFER_M)
+        bbox = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+        # ===== 修复点：sindex 直接给候选“行索引”，不会出现 STRtree id 不一致 KeyError =====
+        cand_idx = list(rest_sindex.intersection(bbox.bounds))
+
+        # 精过滤：餐厅节点是否在 dist_map 内（bitmask 判断只在 candidates 上做）
+        reachable_set = []
+        for j in cand_idx:
+            nj = int(rest_nodes[j])
+            if nj in dist_map:
+                reachable_set.append(j)
+
+        if not reachable_set:
+            return origin_node, w_score, {ri: 0 for ri in origin_rest_indices}
+
+        # 对 origin node 上的每家餐厅，统计 reachable_set 内的 competitor
+        comp_counts: Dict[int, int] = {}
+        for i in origin_rest_indices:
+            my_mask = cat_masks[i]
+            if not my_mask:
+                comp_counts[i] = 0
+                continue
             cnt = 0
-            for n in iso_nodes:
-                for ridx in node_to_rest_idx.get(int(n), []):
-                    if ridx == i:
-                        continue
-                    if (my_mask & cat_masks[ridx]) != 0:
-                        cnt += 1
-            competitor[i] = cnt
+            for j in reachable_set:
+                if j == i:
+                    continue
+                if (my_mask & cat_masks[j]) != 0:
+                    cnt += 1
+            comp_counts[i] = cnt
 
-        if (i + 1) % 200 == 0:
-            print(f"  processed {i+1}/{len(rest_utm)}")
+        return origin_node, w_score, comp_counts
+
+    # 并行按 unique origin node
+    futures = []
+    done_nodes = 0
+    total_nodes = len(node_to_rest_idx)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for origin_node, idxs in node_to_rest_idx.items():
+            futures.append(ex.submit(process_one_origin, int(origin_node), idxs))
+
+        for fut in as_completed(futures):
+            origin_node, w_score, comp_counts = fut.result()
+
+            # 回填：该 node 下所有餐厅 walkability 相同
+            for ri in node_to_rest_idx.get(int(origin_node), []):
+                walkability[ri] = int(w_score)
+
+            # 回填 competitor（仅对该 node 下餐厅）
+            for ri, c in comp_counts.items():
+                competitor[int(ri)] = int(c)
+
+            done_nodes += 1
+            if done_nodes % 200 == 0 or done_nodes == total_nodes:
+                print(f"  processed origin nodes {done_nodes}/{total_nodes}")
 
     out = df.copy()
     out["walkability_score"] = walkability
@@ -311,6 +415,8 @@ def main():
     )
     print(f"[OK] wrote: {OUTPUT_json} (rows={len(out)})")
 
+    end_time = time.time()
+    print(f"\n总运行时间：{end_time - start_time:.2f} 秒")
 
 if __name__ == "__main__":
     main()
