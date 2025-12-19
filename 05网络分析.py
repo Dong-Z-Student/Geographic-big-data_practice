@@ -1,35 +1,14 @@
 # -*- coding: utf-8 -*-
-"""
-Stage 1 - Walk network analysis (tiled OSMnx download)
-Outputs: walkability_score, competitor_density
-- Auto-fetch Philadelphia polygon from OSM (Nominatim)
-- Download walk network by tiles (polygon clipped) to avoid Overpass connection reset
-- Project to UTM 18N (EPSG:32618)
-- Compute per-unique origin node isochrone once, reuse for all restaurants snapped to that node
-- Collect candidate restaurant indices per isochrone, then use bitmask checks (no repeated graph range lookups)
-
-MODIFIED (per user requirements):
-1) Parallelize computation of walkability_score & competitor_density using unique origin nodes:
-   - Each unique node computes isochrone once
-   - Collect candidates once, then restaurant-level checks via bitmask
-2) Remove meaningless retry when polygon has no graph nodes:
-   - If error indicates "Found no graph nodes within the requested polygon", skip tile immediately (no retries)
-3) Keep all other functionality unchanged
-
-NEW (per user request):
-4) Persist the processed walk graph locally (GraphML). If local file exists, load it directly and skip tile download.
-"""
-
 import os
 import time
 import warnings
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import box
+from shapely.geometry import box, MultiPoint
 from shapely.ops import unary_union
 
 import networkx as nx
@@ -42,7 +21,8 @@ warnings.filterwarnings("ignore")
 # User Config
 # =========================
 INPUT_json = r"restaurant_features.json"   # TODO: 改成你的输入文件（JSON Lines）
-OUTPUT_json = r"restaurants_stage1_walk_scores4.json"  # 输出（JSON Lines）
+# ✅ 最终只输出一个文件（Stage1 + Stage2 全部字段）
+OUTPUT_json = r"restaurants_walk_drive_scores.json"  # 输出（JSON Lines）
 
 PLACE_NAME = "Philadelphia, Pennsylvania, USA"
 
@@ -75,13 +55,38 @@ OVERPASS_ENDPOINTS = [
 # 并行线程数（按 unique origin node）
 MAX_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 
-# ===== NEW: 本地路网持久化（最终处理后的 G：已投影 + 已裁剪）=====
+# ===== 本地路网持久化（最终处理后的 G：已投影 + 已裁剪）=====
 LOCAL_GRAPH_DIR = "./local_graph"
-LOCAL_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipped_utm18.graphml")
+LOCAL_WALK_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipped_utm18.graphml")
+
+# ===== Stage2: Drive config =====
+DRIVE_TIME_SECONDS = 900  # 15 min = 900s
+LOCAL_DRIVE_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_drive_clipped_utm18.graphml")
+
+# Drive 默认限速（km/h）：当 edge 无 maxspeed 或无法解析时按 highway 兜底
+# 你可以按需要调整
+DRIVE_DEFAULT_SPEED_KMH = {
+    "motorway": 100,
+    "motorway_link": 60,
+    "trunk": 80,
+    "trunk_link": 50,
+    "primary": 60,
+    "primary_link": 45,
+    "secondary": 50,
+    "secondary_link": 40,
+    "tertiary": 40,
+    "tertiary_link": 35,
+    "residential": 30,
+    "unclassified": 30,
+    "living_street": 15,
+    "service": 20,
+    "road": 30,
+}
+DRIVE_FALLBACK_SPEED_KMH = 30  # 最终兜底
 
 
 # =========================
-# Helpers
+# Helpers (Stage1 保持原逻辑；Stage2 在下方新增，不覆盖原函数行为)
 # =========================
 def configure_osmnx():
     os.makedirs(OSMNX_CACHE_DIR, exist_ok=True)
@@ -230,8 +235,8 @@ def build_cat_bitmask(df: pd.DataFrame, cat_cols: List[str]) -> np.ndarray:
     return masks
 
 
-# ===== NEW: GraphML 本地加载/保存 =====
-def load_graph_if_exists(graphml_path: str) -> nx.MultiDiGraph:
+# ===== GraphML 本地加载/保存（Stage1 已用；Stage2复用）=====
+def load_graph_if_exists(graphml_path: str) -> Optional[nx.MultiDiGraph]:
     """
     若本地 graphml 存在，则直接读取并返回；否则返回 None
     """
@@ -266,6 +271,171 @@ def save_graph_local(G: nx.MultiDiGraph, graphml_path: str):
 
 
 # =========================
+# Stage2 NEW Helpers (Drive)
+# =========================
+def _pick_highway_value(highway_attr) -> Optional[str]:
+    if highway_attr is None:
+        return None
+    if isinstance(highway_attr, (list, tuple)) and len(highway_attr) > 0:
+        # 取第一个（OSMnx常见）
+        return str(highway_attr[0])
+    return str(highway_attr)
+
+
+def _parse_maxspeed_to_kmh(maxspeed_attr) -> Optional[float]:
+    """
+    尝试解析 OSM maxspeed：
+    - 可能是 "35", "25 mph", ["35", "45"], "signals", "walk" 等
+    """
+    if maxspeed_attr is None:
+        return None
+
+    candidates = []
+    if isinstance(maxspeed_attr, (list, tuple)):
+        candidates = [str(x) for x in maxspeed_attr if x is not None]
+    else:
+        candidates = [str(maxspeed_attr)]
+
+    parsed_vals = []
+    for s in candidates:
+        s2 = s.strip().lower()
+        if not s2:
+            continue
+        # 过滤明显非数值
+        if any(tok in s2 for tok in ["signals", "variable", "none", "walk", "national", "urban", "rural"]):
+            continue
+
+        # 提取数字
+        import re
+        nums = re.findall(r"(\d+(\.\d+)?)", s2)
+        if not nums:
+            continue
+        v = float(nums[0][0])
+
+        # mph 转 km/h
+        if "mph" in s2:
+            v = v * 1.609344
+        parsed_vals.append(v)
+
+    if not parsed_vals:
+        return None
+    # 多值取最小更保守
+    return float(min(parsed_vals))
+
+
+def add_drive_time_to_edges(G: nx.MultiDiGraph,
+                            default_speed_map_kmh: Dict[str, float],
+                            fallback_speed_kmh: float):
+    """
+    为 drive 图的每条边添加 drive_time（秒），权重字段名：drive_time
+    逻辑：
+      - 优先 maxspeed
+      - 否则按 highway 默认表
+      - 否则 fallback
+    """
+    for u, v, k, data in G.edges(keys=True, data=True):
+        length_m = data.get("length", None)
+        if length_m is None:
+            data["drive_time"] = np.nan
+            continue
+
+        # 1) maxspeed
+        ms = _parse_maxspeed_to_kmh(data.get("maxspeed", None))
+        if ms is None or ms <= 0:
+            # 2) highway 默认
+            hw = _pick_highway_value(data.get("highway", None))
+            ms = default_speed_map_kmh.get(hw, None)
+        if ms is None or ms <= 0:
+            ms = float(fallback_speed_kmh)
+
+        meters_per_sec = (ms * 1000.0) / 3600.0
+        data["drive_time"] = float(length_m) / meters_per_sec
+
+
+def compute_isochrone_dists_drive(G: nx.MultiDiGraph, origin_node: int, max_time_s: float) -> Dict[int, float]:
+    """
+    drive 的 dijkstra：weight=drive_time
+    """
+    return nx.single_source_dijkstra_path_length(
+        G, origin_node, cutoff=max_time_s, weight="drive_time"
+    )
+
+
+def convex_hull_area_km2_from_nodes(node_ids: List[int],
+                                    node_x: Dict[int, float],
+                                    node_y: Dict[int, float]) -> float:
+    """
+    用可达节点点集的凸包面积作为等时圈面积（km²）
+    - 点太少/退化时做小 buffer 避免面积为 0
+    """
+    pts = []
+    for n in node_ids:
+        x = node_x.get(int(n), None)
+        y = node_y.get(int(n), None)
+        if x is None or y is None:
+            continue
+        if np.isnan(x) or np.isnan(y):
+            continue
+        pts.append((x, y))
+
+    if len(pts) < 3:
+        return 0.0
+
+    geom = MultiPoint(pts).convex_hull
+    area_m2 = float(geom.area)
+
+    # 退化（共线）时 area=0，做一个极小 buffer（1m）避免全为0
+    if area_m2 <= 0:
+        area_m2 = float(MultiPoint(pts).buffer(1.0).area)
+
+    return area_m2 / 1e6
+
+
+def build_drive_graph(place_poly_utm,
+                      target_crs: str,
+                      graphml_path: str) -> nx.MultiDiGraph:
+    """
+    Stage2: drive 路网构建逻辑（tile下载 + merge + project + clip + 本地保存）
+    若本地存在 graphml_path，则直接 load。
+    """
+    Gd = load_graph_if_exists(graphml_path)
+    if Gd is not None:
+        print("[INFO] using local DRIVE graph directly (skip download/merge/project/clip)")
+        return Gd
+
+    print("[S2-1] Generate tiles over polygon (UTM) for DRIVE")
+    tiles_utm = polygon_to_tiles(place_poly_utm, TILE_SIZE_M, TILE_BUFFER_M)
+
+    print("[S2-2] Download DRIVE network by tiles (Overpass) and merge")
+    graphs = []
+    for i, tile_utm in enumerate(tiles_utm, start=1):
+        print(f"  - tile {i}/{len(tiles_utm)}: download drive network")
+        tile_wgs = gpd.GeoSeries([tile_utm], crs=target_crs).to_crs("EPSG:4326").iloc[0]
+        try:
+            Gi = try_download_graph_from_polygon(tile_wgs, network_type="drive")
+            if Gi is None or len(Gi.nodes) == 0:
+                print(f"    [WARN] empty graph, skipped.")
+                continue
+            graphs.append(Gi)
+            print(f"    nodes={len(Gi.nodes):,}, edges={len(Gi.edges):,}")
+        except Exception as e:
+            print(f"    [ERROR] tile failed, skipped: {e}")
+
+    Gd = merge_graphs(graphs)
+    print(f"[INFO] merged DRIVE graph: nodes={len(Gd.nodes):,}, edges={len(Gd.edges):,}")
+
+    print("[S2-3] Project DRIVE graph to UTM 18N")
+    Gd = ox.project_graph(Gd, to_crs=target_crs)
+
+    print("[S2-4] Clip DRIVE graph to place polygon (UTM)")
+    Gd = ox.truncate.truncate_graph_polygon(Gd, place_poly_utm, truncate_by_edge=True)
+    print(f"[INFO] clipped DRIVE graph: nodes={len(Gd.nodes):,}, edges={len(Gd.edges):,}")
+
+    save_graph_local(Gd, graphml_path)
+    return Gd
+
+
+# =========================
 # Main
 # =========================
 def main():
@@ -294,8 +464,13 @@ def main():
     place_utm = place_gdf.to_crs(TARGET_CRS)
     place_poly_utm = unary_union(place_utm.geometry.values)
 
-    # ===== NEW: 优先从本地加载已经“投影+裁剪”的最终路网 =====
-    G = load_graph_if_exists(LOCAL_GRAPHML_PATH)
+    # =========================
+    # Stage 1 (walk) —— 原逻辑保持不变（仅把“写文件”延后到最后一次性写）
+    # =========================
+    print("\n========== Stage 1: WALK ==========")
+
+    # ===== 优先从本地加载已经“投影+裁剪”的最终路网 =====
+    G = load_graph_if_exists(LOCAL_WALK_GRAPHML_PATH)
 
     if G is None:
         print("[3] Generate tiles over polygon (UTM)")
@@ -326,8 +501,8 @@ def main():
         G = ox.truncate.truncate_graph_polygon(G, place_poly_utm, truncate_by_edge=True)
         print(f"[INFO] clipped graph: nodes={len(G.nodes):,}, edges={len(G.edges):,}")
 
-        # NEW: 保存最终路网到本地（下次直接加载）
-        save_graph_local(G, LOCAL_GRAPHML_PATH)
+        # 保存最终路网到本地（下次直接加载）
+        save_graph_local(G, LOCAL_WALK_GRAPHML_PATH)
     else:
         print("[INFO] using local graph directly (skip download/merge/project/clip)")
 
@@ -437,21 +612,93 @@ def main():
             if done_nodes % 200 == 0 or done_nodes == total_nodes:
                 print(f"  processed origin nodes {done_nodes}/{total_nodes}")
 
-    out = df.copy()
-    out["walkability_score"] = walkability
-    out["competitor_density"] = competitor
+    # ✅ 先写回 df，但不落盘（最终统一落盘）
+    df["walkability_score"] = walkability
+    df["competitor_density"] = competitor
 
-    print("[9] Save output (JSON Lines)")
-    out.to_json(
+    t1 = time.time()
+    print(f"\n总运行时间：{t1 - start_time:.2f} 秒")
+
+    # =========================
+    # Stage 2 (drive) —— 新增
+    # =========================
+    print("\n========== Stage 2: DRIVE ==========")
+
+    Gd = build_drive_graph(
+        place_poly_utm=place_poly_utm,
+        target_crs=TARGET_CRS,
+        graphml_path=LOCAL_DRIVE_GRAPHML_PATH
+    )
+
+    print("[S2-5] Add drive_time to edges (speed by maxspeed/highway)")
+    add_drive_time_to_edges(Gd, DRIVE_DEFAULT_SPEED_KMH, DRIVE_FALLBACK_SPEED_KMH)
+
+    print("[S2-6] Snap restaurants to nearest DRIVE nodes")
+    # 注意：这里复用 rest_utm 几何，但 nearest_nodes 需要针对 DRIVE 图
+    xs2 = rest_utm.geometry.x.to_numpy()
+    ys2 = rest_utm.geometry.y.to_numpy()
+    drive_rest_nodes = np.asarray(ox.distance.nearest_nodes(Gd, X=xs2, Y=ys2), dtype=np.int64)
+
+    # node -> restaurant indices (drive)
+    drive_node_to_rest_idx: Dict[int, List[int]] = {}
+    for idx, n in enumerate(drive_rest_nodes):
+        drive_node_to_rest_idx.setdefault(int(n), []).append(idx)
+
+    # 预取 drive node 坐标（UTM）
+    drive_node_x: Dict[int, float] = {}
+    drive_node_y: Dict[int, float] = {}
+    for n, data in Gd.nodes(data=True):
+        drive_node_x[int(n)] = float(data.get("x", np.nan))
+        drive_node_y[int(n)] = float(data.get("y", np.nan))
+
+    drive_score = np.zeros(len(df), dtype=np.float32)
+
+    print("[S2-7] Compute drive_accessibility_score (15-min drive isochrone area, km^2) by unique origin nodes (parallel)")
+
+    def process_one_drive_origin(origin_node: int, origin_rest_indices: List[int]) -> Tuple[int, float]:
+        dist_map = compute_isochrone_dists_drive(Gd, origin_node, DRIVE_TIME_SECONDS)
+        if not dist_map:
+            return origin_node, 0.0
+
+        iso_nodes = list(dist_map.keys())
+        area_km2 = convex_hull_area_km2_from_nodes(iso_nodes, drive_node_x, drive_node_y)
+        return origin_node, float(area_km2)
+
+    futures2 = []
+    done2 = 0
+    total2 = len(drive_node_to_rest_idx)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for origin_node, idxs in drive_node_to_rest_idx.items():
+            futures2.append(ex.submit(process_one_drive_origin, int(origin_node), idxs))
+
+        for fut in as_completed(futures2):
+            origin_node, area_km2 = fut.result()
+
+            for ri in drive_node_to_rest_idx.get(int(origin_node), []):
+                drive_score[ri] = float(area_km2)
+
+            done2 += 1
+            if done2 % 200 == 0 or done2 == total2:
+                print(f"  processed drive origin nodes {done2}/{total2}")
+
+    df["drive_accessibility_score"] = drive_score
+
+    # =========================
+    # Final Output (single file)
+    # =========================
+    print("\n========== Final Output ==========")
+    print("[F] Save output (JSON Lines) with ALL fields")
+    df.to_json(
         OUTPUT_json,
         orient="records",
         lines=True,
         force_ascii=False
     )
-    print(f"[OK] wrote: {OUTPUT_json} (rows={len(out)})")
+    print(f"[OK] wrote: {OUTPUT_json} (rows={len(df)})")
 
-    end_time = time.time()
-    print(f"\n总运行时间：{end_time - start_time:.2f} 秒")
+    t2 = time.time()
+    print(f"\n总运行时间：{t2 - start_time:.2f} 秒")
 
 
 if __name__ == "__main__":
