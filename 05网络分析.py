@@ -57,11 +57,14 @@ MAX_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 
 # ===== 本地路网持久化（最终处理后的 G：已投影 + 已裁剪）=====
 LOCAL_GRAPH_DIR = "./local_graph"
-LOCAL_WALK_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipped_utm18.graphml")
+LOCAL_WALK_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipped_utm18_slim.graphml")
 
 # ===== Stage2: Drive config =====
 DRIVE_TIME_SECONDS = 900  # 15 min = 900s
-LOCAL_DRIVE_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_drive_clipped_utm18.graphml")
+LOCAL_DRIVE_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_drive_clipped_utm18_slim.graphml")
+
+# ✅ South Broad Street sidecar（保存 DRIVE 图时自动生成）
+SOUTH_BROAD_DRIVE_NODES_PATH = os.path.join(LOCAL_GRAPH_DIR, "south_broad_drive_nodes.json")
 
 # Drive 默认限速（km/h）：当 edge 无 maxspeed 或无法解析时按 highway 兜底
 # 你可以按需要调整
@@ -235,7 +238,38 @@ def build_cat_bitmask(df: pd.DataFrame, cat_cols: List[str]) -> np.ndarray:
     return masks
 
 
-# ===== GraphML 本地加载/保存（Stage1 已用；Stage2复用）=====
+# =========================
+# GraphML 本地加载/保存 —— ✅ 仅修改这一块逻辑
+# =========================
+def _graph_has_edge_attr(G: nx.MultiDiGraph, attr_name: str) -> bool:
+    for _, _, _, data in G.edges(keys=True, data=True):
+        if data.get(attr_name, None) is not None:
+            return True
+    return False
+
+
+# ✅ 新增：把 GraphML 读回来的 edge 属性（可能是 str）强制转 float
+def _coerce_edge_attr_to_float(G: nx.MultiDiGraph, attr: str):
+    """
+    GraphML 读回来的 edge attr 可能是 str，这里统一转成 float，避免 Dijkstra 出现 int/float + str。
+    仅对存在且可解析的值处理；不可解析的置为 NaN。
+    """
+    if G is None:
+        return
+    for _, _, _, data in G.edges(keys=True, data=True):
+        if attr not in data:
+            continue
+        v = data.get(attr, None)
+        if v is None:
+            continue
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            continue
+        try:
+            data[attr] = float(v)
+        except Exception:
+            data[attr] = np.nan
+
+
 def load_graph_if_exists(graphml_path: str) -> Optional[nx.MultiDiGraph]:
     """
     若本地 graphml 存在，则直接读取并返回；否则返回 None
@@ -254,20 +288,135 @@ def load_graph_if_exists(graphml_path: str) -> Optional[nx.MultiDiGraph]:
         except Exception:
             pass
 
+        # ✅ 关键修复：根据图类型把权重字段转回 float（避免 dijkstra 报 int+str）
+        fname = os.path.basename(graphml_path).lower()
+        if "walk" in fname:
+            _coerce_edge_attr_to_float(G_local, "travel_time")
+        if "drive" in fname:
+            _coerce_edge_attr_to_float(G_local, "drive_time")
+            _coerce_edge_attr_to_float(G_local, "length")
+
         print(f"[INFO] loaded local graph: nodes={len(G_local.nodes):,}, edges={len(G_local.edges):,}")
         return G_local
     return None
 
 
+def _normalize_osm_name_list(name_attr) -> List[str]:
+    if name_attr is None:
+        return []
+    if isinstance(name_attr, (list, tuple)):
+        return [str(x) for x in name_attr if x is not None]
+    return [str(name_attr)]
+
+
+def _extract_south_broad_drive_nodes_if_possible(G: nx.MultiDiGraph, out_path: str):
+    """
+    只在图里仍有 'name' 字段时尝试提取 South Broad Street 相关节点集合并落盘。
+    """
+    if not out_path:
+        return
+    if os.path.exists(out_path):
+        return
+
+    nodes_set = set()
+    hit_edges = 0
+
+    # 必须包含 broad；prefer south（但允许 Broad St 没写 south）
+    keys_must = ["broad"]
+    keys_prefer = ["south", "s "]
+
+    for u, v, k, data in G.edges(keys=True, data=True):
+        names = _normalize_osm_name_list(data.get("name", None))
+        if not names:
+            continue
+        matched = False
+        for nm in names:
+            s = nm.strip().lower()
+            if not s:
+                continue
+            if all(kw in s for kw in keys_must):
+                if any(kw in s for kw in keys_prefer):
+                    matched = True
+                else:
+                    matched = True
+            if matched:
+                break
+
+        if matched:
+            nodes_set.add(int(u))
+            nodes_set.add(int(v))
+            hit_edges += 1
+
+    if nodes_set:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        import json
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(sorted(nodes_set), f, ensure_ascii=False)
+        print(f"[INFO] saved South Broad drive nodes sidecar: {out_path} (nodes={len(nodes_set)}, edges_hit={hit_edges})")
+    else:
+        print("[WARN] South Broad nodes sidecar not created (no matching edges found).")
+
+
+def _shrink_graph_copy(G: nx.MultiDiGraph,
+                       keep_node_attrs: set,
+                       keep_edge_attrs: set,
+                       keep_graph_attrs: set) -> nx.MultiDiGraph:
+    """
+    生成一个“瘦身副本”用于保存，避免污染内存中的原图（保证其它功能不变）。
+    """
+    Gs = nx.MultiDiGraph()
+    # graph attrs
+    Gs.graph = {k: v for k, v in (G.graph or {}).items() if k in keep_graph_attrs}
+
+    # nodes
+    for n, data in G.nodes(data=True):
+        Gs.add_node(n, **{k: v for k, v in (data or {}).items() if k in keep_node_attrs})
+
+    # edges
+    for u, v, k, data in G.edges(keys=True, data=True):
+        Gs.add_edge(u, v, key=k, **{kk: vv for kk, vv in (data or {}).items() if kk in keep_edge_attrs})
+
+    return Gs
+
+
 def save_graph_local(G: nx.MultiDiGraph, graphml_path: str):
     """
-    将最终路网保存为 graphml
+    ✅ 按我们讨论结果保存：
+      - WALK：只保存 travel_time（不保存 length），避免下次重复计算
+      - DRIVE：保存 drive_time + length（为后续 distance_to_strip），并删掉 highway/maxspeed/name/geometry/osmid 等无用字段
+      - 保存 DRIVE 时若还存在 name，则顺便导出 South Broad nodes sidecar，后续阶段3不依赖 name
     """
     if not graphml_path:
         return
     os.makedirs(os.path.dirname(graphml_path), exist_ok=True)
-    ox.save_graphml(G, filepath=graphml_path)
-    print(f"[INFO] saved local graph: {graphml_path}")
+
+    fname = os.path.basename(graphml_path).lower()
+    is_walk = "walk" in fname
+    is_drive = "drive" in fname
+
+    # graph-level
+    keep_graph_attrs = {"crs"}
+
+    if is_walk:
+        # 只有 travel_time + x/y
+        keep_node_attrs = {"x", "y"}
+        keep_edge_attrs = {"travel_time"}  # ✅ 不保存 length
+        Gs = _shrink_graph_copy(G, keep_node_attrs, keep_edge_attrs, keep_graph_attrs)
+
+    elif is_drive:
+        # 保存 drive_time + length + x/y
+        _extract_south_broad_drive_nodes_if_possible(G, SOUTH_BROAD_DRIVE_NODES_PATH)
+
+        keep_node_attrs = {"x", "y"}
+        keep_edge_attrs = {"drive_time", "length"}  # ✅ drive 必须保留 length
+        Gs = _shrink_graph_copy(G, keep_node_attrs, keep_edge_attrs, keep_graph_attrs)
+
+    else:
+        # 兜底：不做瘦身
+        Gs = G
+
+    ox.save_graphml(Gs, filepath=graphml_path)
+    print(f"[INFO] saved local graph (shrunk): {graphml_path}")
 
 
 # =========================
@@ -277,7 +426,6 @@ def _pick_highway_value(highway_attr) -> Optional[str]:
     if highway_attr is None:
         return None
     if isinstance(highway_attr, (list, tuple)) and len(highway_attr) > 0:
-        # 取第一个（OSMnx常见）
         return str(highway_attr[0])
     return str(highway_attr)
 
@@ -301,25 +449,21 @@ def _parse_maxspeed_to_kmh(maxspeed_attr) -> Optional[float]:
         s2 = s.strip().lower()
         if not s2:
             continue
-        # 过滤明显非数值
         if any(tok in s2 for tok in ["signals", "variable", "none", "walk", "national", "urban", "rural"]):
             continue
 
-        # 提取数字
         import re
         nums = re.findall(r"(\d+(\.\d+)?)", s2)
         if not nums:
             continue
         v = float(nums[0][0])
 
-        # mph 转 km/h
         if "mph" in s2:
             v = v * 1.609344
         parsed_vals.append(v)
 
     if not parsed_vals:
         return None
-    # 多值取最小更保守
     return float(min(parsed_vals))
 
 
@@ -328,10 +472,6 @@ def add_drive_time_to_edges(G: nx.MultiDiGraph,
                             fallback_speed_kmh: float):
     """
     为 drive 图的每条边添加 drive_time（秒），权重字段名：drive_time
-    逻辑：
-      - 优先 maxspeed
-      - 否则按 highway 默认表
-      - 否则 fallback
     """
     for u, v, k, data in G.edges(keys=True, data=True):
         length_m = data.get("length", None)
@@ -339,10 +479,8 @@ def add_drive_time_to_edges(G: nx.MultiDiGraph,
             data["drive_time"] = np.nan
             continue
 
-        # 1) maxspeed
         ms = _parse_maxspeed_to_kmh(data.get("maxspeed", None))
         if ms is None or ms <= 0:
-            # 2) highway 默认
             hw = _pick_highway_value(data.get("highway", None))
             ms = default_speed_map_kmh.get(hw, None)
         if ms is None or ms <= 0:
@@ -366,7 +504,6 @@ def convex_hull_area_km2_from_nodes(node_ids: List[int],
                                     node_y: Dict[int, float]) -> float:
     """
     用可达节点点集的凸包面积作为等时圈面积（km²）
-    - 点太少/退化时做小 buffer 避免面积为 0
     """
     pts = []
     for n in node_ids:
@@ -384,7 +521,6 @@ def convex_hull_area_km2_from_nodes(node_ids: List[int],
     geom = MultiPoint(pts).convex_hull
     area_m2 = float(geom.area)
 
-    # 退化（共线）时 area=0，做一个极小 buffer（1m）避免全为0
     if area_m2 <= 0:
         area_m2 = float(MultiPoint(pts).buffer(1.0).area)
 
@@ -395,7 +531,7 @@ def build_drive_graph(place_poly_utm,
                       target_crs: str,
                       graphml_path: str) -> nx.MultiDiGraph:
     """
-    Stage2: drive 路网构建逻辑（tile下载 + merge + project + clip + 本地保存）
+    Stage2: drive 路网构建逻辑（tile下载 + merge + project + clip）
     若本地存在 graphml_path，则直接 load。
     """
     Gd = load_graph_if_exists(graphml_path)
@@ -431,7 +567,6 @@ def build_drive_graph(place_poly_utm,
     Gd = ox.truncate.truncate_graph_polygon(Gd, place_poly_utm, truncate_by_edge=True)
     print(f"[INFO] clipped DRIVE graph: nodes={len(Gd.nodes):,}, edges={len(Gd.edges):,}")
 
-    save_graph_local(Gd, graphml_path)
     return Gd
 
 
@@ -449,7 +584,8 @@ def _init_drive_worker(graphml_path: str,
                        default_speed_map: Dict[str, float],
                        fallback_speed_kmh: float):
     """
-    每个进程启动时初始化一次 DRIVE 图、drive_time、node坐标
+    每个进程启动时初始化一次 DRIVE 图、node坐标
+    ✅ 若图里已带 drive_time（我们保存时会带），则不再重复计算 drive_time
     """
     global _D_G, _D_NODE_X, _D_NODE_Y, _D_CUTOFF
 
@@ -466,8 +602,15 @@ def _init_drive_worker(graphml_path: str,
     except Exception:
         pass
 
-    # 每个进程自己补齐 drive_time（不依赖主进程的 Gd）
-    add_drive_time_to_edges(_D_G, default_speed_map, fallback_speed_kmh)
+    # ✅ 关键修复：worker 内再次保证权重字段是 float（防止 GraphML 读回是 str）
+    _coerce_edge_attr_to_float(_D_G, "drive_time")
+    _coerce_edge_attr_to_float(_D_G, "length")
+
+    # ✅ 如果缺 drive_time 才计算（兼容旧图）
+    if not _graph_has_edge_attr(_D_G, "drive_time"):
+        add_drive_time_to_edges(_D_G, default_speed_map, fallback_speed_kmh)
+        # 刚算完也确保是 float
+        _coerce_edge_attr_to_float(_D_G, "drive_time")
 
     _D_NODE_X = {}
     _D_NODE_Y = {}
@@ -524,7 +667,6 @@ def main():
     # =========================
     print("\n========== Stage 1: WALK ==========")
 
-    # ===== 优先从本地加载已经“投影+裁剪”的最终路网 =====
     G = load_graph_if_exists(LOCAL_WALK_GRAPHML_PATH)
 
     if G is None:
@@ -556,13 +698,17 @@ def main():
         G = ox.truncate.truncate_graph_polygon(G, place_poly_utm, truncate_by_edge=True)
         print(f"[INFO] clipped graph: nodes={len(G.nodes):,}, edges={len(G.edges):,}")
 
-        # 保存最终路网到本地（下次直接加载）
-        save_graph_local(G, LOCAL_WALK_GRAPHML_PATH)
     else:
-        print("[INFO] using local graph directly (skip download/merge/project/clip)")
+        print("[INFO] using local WALK graph directly (skip download/merge/project/clip)")
 
-    print("[6] Add walking travel_time to edges")
-    add_walk_time_to_edges(G, WALK_SPEED_KMH)
+    if not _graph_has_edge_attr(G, "travel_time"):
+        print("[6] Add walking travel_time to edges")
+        add_walk_time_to_edges(G, WALK_SPEED_KMH)
+    else:
+        print("[6] travel_time already exists in local WALK graph, skip recompute")
+
+    if not os.path.exists(LOCAL_WALK_GRAPHML_PATH):
+        save_graph_local(G, LOCAL_WALK_GRAPHML_PATH)
 
     rest_utm = rest_gdf.to_crs(TARGET_CRS)
 
@@ -573,19 +719,16 @@ def main():
 
     rest_utm["__node__"] = rest_nodes
 
-    # node -> restaurant indices
     node_to_rest_idx: Dict[int, List[int]] = {}
     for idx, n in enumerate(rest_nodes):
         node_to_rest_idx.setdefault(int(n), []).append(idx)
 
-    # 预取 node 坐标，给 isochrone bbox 用（投影后 G.nodes[u]['x'/'y'] 是米）
     node_x: Dict[int, float] = {}
     node_y: Dict[int, float] = {}
     for n, data in G.nodes(data=True):
         node_x[int(n)] = float(data.get("x", np.nan))
         node_y[int(n)] = float(data.get("y", np.nan))
 
-    # sindex 直接返回行索引（不会有 STRtree id 不一致问题）
     rest_sindex = rest_utm.sindex
 
     walkability = np.zeros(len(rest_utm), dtype=np.int32)
@@ -601,7 +744,6 @@ def main():
         iso_nodes = list(dist_map.keys())
         w_score = len(iso_nodes)
 
-        # bbox for candidates (min/max of reachable node coords)
         xs_ = []
         ys_ = []
         for n in iso_nodes:
@@ -667,7 +809,6 @@ def main():
             if done_nodes % 200 == 0 or done_nodes == total_nodes:
                 print(f"  processed origin nodes {done_nodes}/{total_nodes}")
 
-    # ✅ 先写回 df，但不落盘（最终统一落盘）
     df["walkability_score"] = walkability
     df["competitor_density"] = competitor
 
@@ -685,16 +826,24 @@ def main():
         graphml_path=LOCAL_DRIVE_GRAPHML_PATH
     )
 
-    print("[S2-5] Add drive_time to edges (speed by maxspeed/highway)")
-    add_drive_time_to_edges(Gd, DRIVE_DEFAULT_SPEED_KMH, DRIVE_FALLBACK_SPEED_KMH)
+    # ✅ 主进程也做一次防护（如果是本地读回，类型可能是 str）
+    _coerce_edge_attr_to_float(Gd, "drive_time")
+    _coerce_edge_attr_to_float(Gd, "length")
+
+    if not _graph_has_edge_attr(Gd, "drive_time"):
+        print("[S2-5] Add drive_time to edges (speed by maxspeed/highway)")
+        add_drive_time_to_edges(Gd, DRIVE_DEFAULT_SPEED_KMH, DRIVE_FALLBACK_SPEED_KMH)
+    else:
+        print("[S2-5] drive_time already exists in local DRIVE graph, skip recompute")
+
+    if not os.path.exists(LOCAL_DRIVE_GRAPHML_PATH):
+        save_graph_local(Gd, LOCAL_DRIVE_GRAPHML_PATH)
 
     print("[S2-6] Snap restaurants to nearest DRIVE nodes")
-    # 注意：这里复用 rest_utm 几何，但 nearest_nodes 需要针对 DRIVE 图
     xs2 = rest_utm.geometry.x.to_numpy()
     ys2 = rest_utm.geometry.y.to_numpy()
     drive_rest_nodes = np.asarray(ox.distance.nearest_nodes(Gd, X=xs2, Y=ys2), dtype=np.int64)
 
-    # node -> restaurant indices (drive)
     drive_node_to_rest_idx: Dict[int, List[int]] = {}
     for idx, n in enumerate(drive_rest_nodes):
         drive_node_to_rest_idx.setdefault(int(n), []).append(idx)
@@ -707,7 +856,6 @@ def main():
     done2 = 0
     total2 = len(drive_node_to_rest_idx)
 
-    # ✅ 进程池：每个进程初始化一次 drive 图 + drive_time + 坐标
     with ProcessPoolExecutor(
         max_workers=MAX_WORKERS,
         initializer=_init_drive_worker,
