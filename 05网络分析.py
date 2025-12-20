@@ -1139,6 +1139,73 @@ def main():
     t3 = time.time()
     print(f"\n阶段三总运行时间：{t3 - t2:.2f} 秒")
 
+
+    # =========================
+    # Stage 4 (NEW): SENTIMENT NEIGHBORHOOD (500m, non-parallel)
+    # =========================
+    print("\n========== Stage 4: SENTIMENT NEIGHBORHOOD ==========")
+
+    # 确保情感字段存在
+    if "avg_sentiment_polarity" not in df.columns:
+        raise ValueError("Missing required column: avg_sentiment_polarity")
+
+    # 使用已经构建好的 UTM 餐厅点（Stage 1 已有）
+    # rest_utm: GeoDataFrame (UTM)
+    # df: 原始 DataFrame（索引一一对应）
+
+    sentiment_vals = df["avg_sentiment_polarity"].to_numpy(dtype=float)
+    coords_x = rest_utm.geometry.x.to_numpy(dtype=float)
+    coords_y = rest_utm.geometry.y.to_numpy(dtype=float)
+
+    # 空间索引
+    sindex = rest_utm.sindex
+
+    radius = 500.0  # meters
+    radius_sq = radius * radius
+
+    neigh_avg = np.full(len(df), np.nan, dtype=np.float32)
+
+    t4_start = time.time()
+
+    for i in range(len(df)):
+        xi = coords_x[i]
+        yi = coords_y[i]
+
+        # bbox 粗筛
+        minx = xi - radius
+        maxx = xi + radius
+        miny = yi - radius
+        maxy = yi + radius
+
+        cand_idx = list(sindex.intersection((minx, miny, maxx, maxy)))
+        if not cand_idx:
+            continue
+
+        vals = []
+
+        for j in cand_idx:
+            if j == i:
+                continue
+
+            dx = coords_x[j] - xi
+            dy = coords_y[j] - yi
+            if dx * dx + dy * dy <= radius_sq:
+                v = sentiment_vals[j]
+                if not np.isnan(v):
+                    vals.append(v)
+
+        if vals:
+            neigh_avg[i] = float(np.mean(vals))
+
+        if (i + 1) % 500 == 0 or (i + 1) == len(df):
+            print(f"  processed restaurants {i+1}/{len(df)}")
+
+    df["sentiment_neighborhood_avg"] = neigh_avg
+
+    t4 = time.time()
+    print(f"\n阶段四总运行时间：{t4 - t3:.2f} 秒")
+
+
     # =========================
     # Final Output (single file)
     # =========================
