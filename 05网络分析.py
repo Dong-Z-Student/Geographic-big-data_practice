@@ -3,7 +3,7 @@ import os
 import time
 import warnings
 from typing import List, Dict, Tuple, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed  # ✅ 仅新增 ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -436,6 +436,61 @@ def build_drive_graph(place_poly_utm,
 
 
 # =========================
+# ✅ Stage2 进程池 worker（仅新增，不影响 Stage1）
+# =========================
+_D_G = None
+_D_NODE_X = None
+_D_NODE_Y = None
+_D_CUTOFF = None
+
+
+def _init_drive_worker(graphml_path: str,
+                       cutoff_s: int,
+                       default_speed_map: Dict[str, float],
+                       fallback_speed_kmh: float):
+    """
+    每个进程启动时初始化一次 DRIVE 图、drive_time、node坐标
+    """
+    global _D_G, _D_NODE_X, _D_NODE_Y, _D_CUTOFF
+
+    _D_CUTOFF = int(cutoff_s)
+
+    _D_G = ox.load_graphml(graphml_path)
+    # GraphML 节点 id 可能是 str，尽量转回 int
+    try:
+        any_node = next(iter(_D_G.nodes))
+        if isinstance(any_node, str) and any_node.isdigit():
+            mapping = {n: int(n) for n in _D_G.nodes if isinstance(n, str) and n.isdigit()}
+            if len(mapping) == len(_D_G.nodes):
+                _D_G = nx.relabel_nodes(_D_G, mapping, copy=True)
+    except Exception:
+        pass
+
+    # 每个进程自己补齐 drive_time（不依赖主进程的 Gd）
+    add_drive_time_to_edges(_D_G, default_speed_map, fallback_speed_kmh)
+
+    _D_NODE_X = {}
+    _D_NODE_Y = {}
+    for n, data in _D_G.nodes(data=True):
+        _D_NODE_X[int(n)] = float(data.get("x", np.nan))
+        _D_NODE_Y[int(n)] = float(data.get("y", np.nan))
+
+
+def _drive_task(origin_node: int) -> Tuple[int, float]:
+    global _D_G, _D_NODE_X, _D_NODE_Y, _D_CUTOFF
+
+    dist_map = nx.single_source_dijkstra_path_length(
+        _D_G, origin_node, cutoff=_D_CUTOFF, weight="drive_time"
+    )
+    if not dist_map:
+        return origin_node, 0.0
+
+    iso_nodes = list(dist_map.keys())
+    area_km2 = convex_hull_area_km2_from_nodes(iso_nodes, _D_NODE_X, _D_NODE_Y)
+    return origin_node, float(area_km2)
+
+
+# =========================
 # Main
 # =========================
 def main():
@@ -465,7 +520,7 @@ def main():
     place_poly_utm = unary_union(place_utm.geometry.values)
 
     # =========================
-    # Stage 1 (walk) —— 原逻辑保持不变（仅把“写文件”延后到最后一次性写）
+    # Stage 1 (walk) —— ✅ 保持线程并行不变
     # =========================
     print("\n========== Stage 1: WALK ==========")
 
@@ -617,10 +672,10 @@ def main():
     df["competitor_density"] = competitor
 
     t1 = time.time()
-    print(f"\n总运行时间：{t1 - start_time:.2f} 秒")
+    print(f"\n阶段一总运行时间：{t1 - start_time:.2f} 秒")
 
     # =========================
-    # Stage 2 (drive) —— 新增
+    # Stage 2 (drive) —— ✅ 改为进程并行
     # =========================
     print("\n========== Stage 2: DRIVE ==========")
 
@@ -644,33 +699,27 @@ def main():
     for idx, n in enumerate(drive_rest_nodes):
         drive_node_to_rest_idx.setdefault(int(n), []).append(idx)
 
-    # 预取 drive node 坐标（UTM）
-    drive_node_x: Dict[int, float] = {}
-    drive_node_y: Dict[int, float] = {}
-    for n, data in Gd.nodes(data=True):
-        drive_node_x[int(n)] = float(data.get("x", np.nan))
-        drive_node_y[int(n)] = float(data.get("y", np.nan))
-
     drive_score = np.zeros(len(df), dtype=np.float32)
 
     print("[S2-7] Compute drive_accessibility_score (15-min drive isochrone area, km^2) by unique origin nodes (parallel)")
-
-    def process_one_drive_origin(origin_node: int, origin_rest_indices: List[int]) -> Tuple[int, float]:
-        dist_map = compute_isochrone_dists_drive(Gd, origin_node, DRIVE_TIME_SECONDS)
-        if not dist_map:
-            return origin_node, 0.0
-
-        iso_nodes = list(dist_map.keys())
-        area_km2 = convex_hull_area_km2_from_nodes(iso_nodes, drive_node_x, drive_node_y)
-        return origin_node, float(area_km2)
 
     futures2 = []
     done2 = 0
     total2 = len(drive_node_to_rest_idx)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for origin_node, idxs in drive_node_to_rest_idx.items():
-            futures2.append(ex.submit(process_one_drive_origin, int(origin_node), idxs))
+    # ✅ 进程池：每个进程初始化一次 drive 图 + drive_time + 坐标
+    with ProcessPoolExecutor(
+        max_workers=MAX_WORKERS,
+        initializer=_init_drive_worker,
+        initargs=(
+            LOCAL_DRIVE_GRAPHML_PATH,
+            DRIVE_TIME_SECONDS,
+            DRIVE_DEFAULT_SPEED_KMH,
+            DRIVE_FALLBACK_SPEED_KMH
+        ),
+    ) as ex:
+        for origin_node in drive_node_to_rest_idx.keys():
+            futures2.append(ex.submit(_drive_task, int(origin_node)))
 
         for fut in as_completed(futures2):
             origin_node, area_km2 = fut.result()
@@ -698,7 +747,7 @@ def main():
     print(f"[OK] wrote: {OUTPUT_json} (rows={len(df)})")
 
     t2 = time.time()
-    print(f"\n总运行时间：{t2 - start_time:.2f} 秒")
+    print(f"\n阶段二总运行时间：{t2 - t1:.2f} 秒")
 
 
 if __name__ == "__main__":
