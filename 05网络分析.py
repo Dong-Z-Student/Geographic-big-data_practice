@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import box, MultiPoint
+from shapely.geometry import box, MultiPoint, LineString, MultiLineString
 from shapely.ops import unary_union
 
 import networkx as nx
@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 # User Config
 # =========================
 INPUT_json = r"restaurant_features.json"   # TODO: 改成你的输入文件（JSON Lines）
-# ✅ 最终只输出一个文件（Stage1 + Stage2 全部字段）
+# ✅ 最终只输出一个文件（Stage1 + Stage2 + Stage3 全部字段）
 OUTPUT_json = r"restaurants_walk_drive_scores.json"  # 输出（JSON Lines）
 
 PLACE_NAME = "Philadelphia, Pennsylvania, USA"
@@ -63,8 +63,13 @@ LOCAL_WALK_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipp
 DRIVE_TIME_SECONDS = 900  # 15 min = 900s
 LOCAL_DRIVE_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_drive_clipped_utm18_slim.graphml")
 
-# ✅ South Broad Street sidecar（保存 DRIVE 图时自动生成）
+# ✅ South Broad Street sidecar（保存 DRIVE 图时自动生成；Stage3 会优先读取，缺失则自动构建）
 SOUTH_BROAD_DRIVE_NODES_PATH = os.path.join(LOCAL_GRAPH_DIR, "south_broad_drive_nodes.json")
+
+# ===== Stage3: Centrality & Strip Distance config =====
+# ✅ 预留参数：后续你可把 BC_K 改成 500/1000 等做近似对比；None 表示全节点精确
+BC_K: Optional[int] = 1000
+BC_SEED = 42  # 仅在 BC_K 不为 None 时用于可复现采样（NetworkX 支持 seed）
 
 # Drive 默认限速（km/h）：当 edge 无 maxspeed 或无法解析时按 highway 兜底
 # 你可以按需要调整
@@ -634,6 +639,205 @@ def _drive_task(origin_node: int) -> Tuple[int, float]:
 
 
 # =========================
+# Stage3 Helpers (NEW) —— ✅ 只新增，不改 Stage1/Stage2
+# =========================
+def _load_strip_nodes_sidecar(path: str) -> Optional[List[int]]:
+    if not path or not os.path.exists(path):
+        return None
+    import json
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+        if not isinstance(arr, list):
+            return None
+        out = []
+        for x in arr:
+            try:
+                out.append(int(x))
+            except Exception:
+                pass
+        return out if out else None
+    except Exception:
+        return None
+
+
+def _iter_lines_from_geometry(geom):
+    if geom is None or geom.is_empty:
+        return
+    if isinstance(geom, LineString):
+        yield geom
+    elif isinstance(geom, MultiLineString):
+        for g in geom.geoms:
+            if isinstance(g, LineString) and not g.is_empty:
+                yield g
+
+
+def _sample_points_on_lines(lines: List[LineString], step_m: float = 30.0, max_points: int = 20000) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    在若干 LineString 上按间隔采样点，用于 nearest_edges。
+    """
+    xs = []
+    ys = []
+    for ln in lines:
+        if ln is None or ln.is_empty:
+            continue
+        length = float(ln.length)
+        if length <= 0:
+            continue
+        n = int(max(2, min(1 + length / step_m, 3000)))
+        for i in range(n):
+            if len(xs) >= max_points:
+                return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+            d = (i / (n - 1)) * length
+            p = ln.interpolate(d)
+            xs.append(float(p.x))
+            ys.append(float(p.y))
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+
+
+def _build_strip_nodes_from_osm_features(Gd: nx.MultiDiGraph,
+                                        place_name: str,
+                                        target_crs: str,
+                                        out_path: str) -> Optional[List[int]]:
+    """
+    当 sidecar 不存在时：从 OSM 直接抓取 South Broad Street 的线要素，
+    然后在 Gd 上用 nearest_edges 把这些线映射到 Gd 的边，得到 strip nodes 集合并落盘。
+    不依赖 Gd.edge['name']（因为你的 drive 图是 slim 的）。
+    """
+    print("[S3-2] South Broad sidecar not found, try building from OSM features (name=South Broad Street) ...")
+
+    candidates = [
+        {"name": "South Broad Street"},
+        {"name": "S Broad St"},
+        {"name": "Broad Street"},
+        {"name": "Broad St"},
+    ]
+
+    gfeat = None
+    for tags in candidates:
+        try:
+            # OSMnx 2.x: features_from_place
+            gf = ox.features_from_place(place_name, tags=tags)
+            if gf is not None and len(gf) > 0:
+                # 只要线
+                gf = gf[gf.geometry.type.isin(["LineString", "MultiLineString"])].copy()
+                if len(gf) > 0:
+                    gfeat = gf
+                    print(f"[S3-2] OSM features hit with tags={tags}, rows={len(gf)}")
+                    break
+        except Exception:
+            continue
+
+    if gfeat is None or len(gfeat) == 0:
+        print("[WARN] Failed to fetch South Broad features from OSM (features_from_place).")
+        return None
+
+    try:
+        gfeat = gfeat.to_crs(target_crs)
+    except Exception:
+        # 如果 features CRS 不可用，强制认为是 WGS84 再投影
+        gfeat = gfeat.set_crs("EPSG:4326", allow_override=True).to_crs(target_crs)
+
+    # 收集所有线
+    lines = []
+    for geom in gfeat.geometry.values:
+        for ln in _iter_lines_from_geometry(geom):
+            lines.append(ln)
+
+    if not lines:
+        print("[WARN] South Broad features contain no LineString geometries.")
+        return None
+
+    xs, ys = _sample_points_on_lines(lines, step_m=30.0, max_points=20000)
+    if xs.size == 0:
+        print("[WARN] No sample points generated for South Broad geometries.")
+        return None
+
+    # 用 sampled points 贴到 drive 图的边
+    try:
+        us, vs, ks = ox.distance.nearest_edges(Gd, X=xs, Y=ys)
+    except Exception as e:
+        print(f"[WARN] nearest_edges failed: {e}")
+        return None
+
+    strip_nodes = set()
+    # nearest_edges 返回的 u/v/k 可能是标量或数组
+    if np.isscalar(us):
+        strip_nodes.add(int(us))
+        strip_nodes.add(int(vs))
+    else:
+        for u, v in zip(us, vs):
+            try:
+                strip_nodes.add(int(u))
+                strip_nodes.add(int(v))
+            except Exception:
+                pass
+
+    if not strip_nodes:
+        print("[WARN] Could not map South Broad features onto DRIVE graph edges.")
+        return None
+
+    # 落盘 sidecar
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        import json
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(sorted(strip_nodes), f, ensure_ascii=False)
+        print(f"[INFO] saved South Broad drive nodes sidecar (rebuilt): {out_path} (nodes={len(strip_nodes)})")
+    except Exception:
+        pass
+
+    return sorted(strip_nodes)
+
+
+def _compute_betweenness_centrality_drive(Gd: nx.MultiDiGraph,
+                                         weight: str,
+                                         k: Optional[int],
+                                         seed: int,
+                                         normalized: bool) -> Dict[int, float]:
+    """
+    按你的要求：
+      - drive 图
+      - weight=length
+      - directed（原图）
+      - normalized=False
+      - k 参数预留：None => 全节点精确；否则采样近似
+    """
+    print("[S3-1] Compute betweenness_centrality on DRIVE graph (directed, weight=length, normalized=False)")
+    # NetworkX 在 k=None 时不会用到 seed；k!=None 才会用到 seed
+    try:
+        bc = nx.betweenness_centrality(Gd, k=k, weight=weight, normalized=normalized, seed=seed)
+    except TypeError:
+        # 兼容旧 networkx 版本：可能不支持 seed 参数
+        bc = nx.betweenness_centrality(Gd, k=k, weight=weight, normalized=normalized)
+    # 强制 key 为 int
+    out = {}
+    for n, v in bc.items():
+        try:
+            out[int(n)] = float(v)
+        except Exception:
+            pass
+    return out
+
+
+def _compute_distance_to_strip_drive(Gd: nx.MultiDiGraph,
+                                     strip_nodes: List[int],
+                                     weight: str) -> Dict[int, float]:
+    """
+    多源 Dijkstra：一次得到全图每个节点到 strip_nodes 最近距离（按 length）。
+    """
+    print("[S3-3] Multi-source Dijkstra for distance_to_strip on DRIVE graph (weight=length)")
+    dist = nx.multi_source_dijkstra_path_length(Gd, sources=set(strip_nodes), weight=weight)
+    out = {}
+    for n, v in dist.items():
+        try:
+            out[int(n)] = float(v)
+        except Exception:
+            pass
+    return out
+
+
+# =========================
 # Main
 # =========================
 def main():
@@ -815,6 +1019,7 @@ def main():
     t1 = time.time()
     print(f"\n阶段一总运行时间：{t1 - start_time:.2f} 秒")
 
+
     # =========================
     # Stage 2 (drive) —— ✅ 改为进程并行
     # =========================
@@ -881,6 +1086,59 @@ def main():
 
     df["drive_accessibility_score"] = drive_score
 
+    t2 = time.time()
+    print(f"\n阶段二总运行时间：{t2 - t1:.2f} 秒")
+
+
+    # =========================
+    # Stage 3 (NEW) —— ✅ 只新增，不改 Stage1/Stage2
+    # =========================
+    print("\n========== Stage 3: CENTRALITY & STRIP DIST ==========")
+
+    # [S3-1] Betweenness centrality on DRIVE graph
+    # 按你的要求：directed + weight=length + normalized=False + k 预留（默认 None 全节点精确）
+    bc_map = _compute_betweenness_centrality_drive(
+        Gd, weight="length", k=BC_K, seed=BC_SEED, normalized=False
+    )
+
+    # [S3-2] South Broad Street nodes sidecar
+    strip_nodes = _load_strip_nodes_sidecar(SOUTH_BROAD_DRIVE_NODES_PATH)
+    if strip_nodes is None:
+        strip_nodes = _build_strip_nodes_from_osm_features(
+            Gd=Gd,
+            place_name=PLACE_NAME,
+            target_crs=TARGET_CRS,
+            out_path=SOUTH_BROAD_DRIVE_NODES_PATH
+        )
+
+    # [S3-3] Multi-source dijkstra distance to strip (length)
+    dist_to_strip = {}
+    if strip_nodes is None or len(strip_nodes) == 0:
+        print("[WARN] South Broad strip nodes not available; distance_to_strip will be NaN.")
+    else:
+        dist_to_strip = _compute_distance_to_strip_drive(Gd, strip_nodes=strip_nodes, weight="length")
+
+    # [S3-4] Map to restaurants by snapped DRIVE node (unique node reuse)
+    betweenness_arr = np.full(len(df), np.nan, dtype=np.float64)
+    dist_strip_arr = np.full(len(df), np.nan, dtype=np.float64)
+
+    # unique node reuse: 同一 drive node 下的餐厅复用同一个值
+    unique_nodes = list(drive_node_to_rest_idx.keys())
+    for n in unique_nodes:
+        n_int = int(n)
+        bc_val = bc_map.get(n_int, 0.0)  # 没找到则按 0
+        d_val = dist_to_strip.get(n_int, np.nan)  # 不可达则 NaN
+
+        for ri in drive_node_to_rest_idx.get(n_int, []):
+            betweenness_arr[int(ri)] = float(bc_val)
+            dist_strip_arr[int(ri)] = float(d_val) if not (d_val is None or np.isnan(d_val)) else np.nan
+
+    df["betweenness_centrality"] = betweenness_arr
+    df["distance_to_strip"] = dist_strip_arr
+
+    t3 = time.time()
+    print(f"\n阶段三总运行时间：{t3 - t2:.2f} 秒")
+
     # =========================
     # Final Output (single file)
     # =========================
@@ -894,8 +1152,8 @@ def main():
     )
     print(f"[OK] wrote: {OUTPUT_json} (rows={len(df)})")
 
-    t2 = time.time()
-    print(f"\n阶段二总运行时间：{t2 - t1:.2f} 秒")
+    t = time.time()
+    print(f"\n总运行时间：{t - start_time:.2f} 秒")
 
 
 if __name__ == "__main__":
