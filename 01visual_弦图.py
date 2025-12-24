@@ -118,10 +118,18 @@ def draw_chord_diagram(categories, node_sizes, matrix, out_png):
         )
 
     # ---------- 画弦 ----------
-    max_w = matrix.max()
-    for i in range(n):
-        for j in range(i + 1, n):
-            w = matrix[i, j]
+    # ---------- 画弦（仅 Restaurants 与其他类别） ----------
+    if "Restaurants" not in categories:
+        print("WARNING: 'Restaurants' not in top categories, no edges drawn.")
+    else:
+        r_idx = categories.index("Restaurants")
+        max_w = matrix[r_idx].max()
+
+        for j in range(n):
+            if j == r_idx:
+                continue
+
+            w = matrix[r_idx, j]
             if w == 0:
                 continue
 
@@ -129,8 +137,8 @@ def draw_chord_diagram(categories, node_sizes, matrix, out_png):
             color = cmap(0.3 + 0.7 * edge_norm(w))
 
             verts = [
-                (angles[i], 9.8),
-                (angles[i], 3.0),
+                (angles[r_idx], 9.8),
+                (angles[r_idx], 3.0),
                 (angles[j], 3.0),
                 (angles[j], 9.8)
             ]
