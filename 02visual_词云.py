@@ -5,7 +5,7 @@ import re
 import string
 import os
 from collections import Counter
-from textblob import TextBlob  # 导入textblob库用于情感分析
+from textblob import TextBlob
 
 # 修改为jsonl文件路径
 jsonl_file_path = "餐厅整体评论数据_parallel.jsonl"
