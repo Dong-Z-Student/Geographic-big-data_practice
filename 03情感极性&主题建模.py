@@ -1,21 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-03 情感 + LDA 主题特征构建（餐厅级）
-
-输入（按行JSON，每行一个review记录）字段固定包含：
-"review_id", "text_clean", "business_id", "price_range", "stars", "review_count",
-"latitude", "longitude", "cat__***"
-
-满足需求：
-1) TextBlob 情感：逐条评论 polarity/subjectivity，按 business 求均值
-2) gensim LdaMulticore：可配置训练比例（默认100%），随机抽样
-3) num_topics=5；推断主题向量；导出每个topic的top words供判读
-4) 输出餐厅级：business字段 + 所有cat__字段 + avg_sentiment_* + topic_*
-5) 输出可选：CSV 与 按行 JSON（扩展名可用 .json）
-"""
-
 import json
-import csv
 import random
 import time
 import os
@@ -28,23 +12,18 @@ from textblob import TextBlob
 from gensim.corpora import Dictionary
 from gensim.models import LdaMulticore
 
-
-# =========================
-# 固定字段名
-# =========================
-TEXT_FIELD = "text_clean"   # 按你的要求写死
+TEXT_FIELD = "text_clean"
 
 LDA_EXTRA_STOPWORDS = {
     "good", "great", "just", "really", "nice", "best",
     "love", "like", "amazing", "pretty", "don", "didn", "ve", "did"
 }
 
-
 # =========================
 # 读写工具
 # =========================
 def iter_json_lines(path: str) -> Iterable[Dict[str, Any]]:
-    """逐行读取（每行一个 JSON 对象）。"""
+    """逐行读取"""
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -56,15 +35,8 @@ def iter_json_lines(path: str) -> Iterable[Dict[str, Any]]:
                 continue
 
 
-def write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def write_json_lines(path: str, rows: List[Dict[str, Any]]) -> None:
-    """按行写 JSON（可用 .json 后缀，但内容是 line-delimited JSON）。"""
+    """按行写 JSON"""
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -88,9 +60,8 @@ def save_topic_words_json(path: str, topic_words: Dict[int, List[Tuple[str, floa
 # =========================
 def tokenize_for_lda(text: str) -> List[str]:
     """
-    text_clean 已预处理，这里仅做：
     - 空格切分
-    - 移除 LDA 专用停用词（不影响 TextBlob）
+    - 移除 LDA 停用词
     """
     if not text:
         return []
@@ -102,7 +73,7 @@ def extract_category_columns(sample_record: Dict[str, Any], prefix: str = "cat__
 
 
 # =========================
-# LDA 训练：随机抽样语料（流式 I/O）
+# LDA 训练：随机抽样语料
 # =========================
 def build_lda_training_texts(
     input_path: str,
@@ -177,16 +148,15 @@ def get_topic_words(lda: LdaMulticore, topn: int = 15) -> Dict[int, List[Tuple[s
 
 
 # ============================================================
-# ✅ 餐厅级聚合（并行版）：I/O 单线程 + 计算多进程 + 主进程 reduce
+# 餐厅级聚合：I/O 单线程 + 计算多进程 + 主进程 reduce
 # ============================================================
-
-# worker 全局（每个进程各一份）
+# worker 全局
 _W_LDA = None
 _W_DICT = None
 _W_NUM_TOPICS = 0
 
 def _worker_init(lda_path: str, dict_path: str, num_topics: int):
-    """worker 启动时加载模型/词典（避免 pickle 传大对象）。"""
+    """worker 启动时加载模型/词典"""
     global _W_LDA, _W_DICT, _W_NUM_TOPICS
     _W_LDA = LdaMulticore.load(lda_path)
     _W_DICT = Dictionary.load(dict_path)
@@ -202,11 +172,11 @@ def _dense_topic_vector_worker(bow) -> List[float]:
 def _process_chunk(args):
     """
     处理一个 chunk（list[dict]），并在 worker 内部对 business_id 做局部聚合。
-    返回：局部聚合结果（体积小，便于主进程 reduce）。
+    返回：局部聚合结果
     """
     chunk, category_cols = args
 
-    # 1) 静态字段（每个bid只保留一次）
+    # 1) 静态字段
     static_map: Dict[str, Dict[str, Any]] = {}
 
     # 2) 情感局部聚合
@@ -259,7 +229,6 @@ def _process_chunk(args):
             s[i] += vec[i]
         topic_cnt[bid] += 1
 
-    # defaultdict 不能直接跨进程安全传输，转成普通 dict
     topic_sum = {k: v for k, v in topic_sum.items()}
 
     return static_map, dict(sent_sum_pol), dict(sent_sum_sub), dict(sent_cnt), topic_sum, dict(topic_cnt)
@@ -275,13 +244,13 @@ def build_restaurant_level_dataset_parallel(
 ) -> List[Dict[str, Any]]:
     """
     并行版第二遍扫描：对每条 review 计算 sentiment + topic 向量，并按 business_id 聚合。
-    - chunk_size：主进程每次读多少条组成一个 chunk 发给 worker（越大 IPC 越少，但内存更高）
-    - workers：并行进程数（0=自动 cpu-1）
+    - chunk_size：主进程每次读多少条组成一个 chunk 发给 worker
+    - workers：并行进程数
     """
     if workers <= 0:
         workers = max(1, (os.cpu_count() or 4) - 1)
 
-    # --- 将模型/词典保存到临时文件，供 worker initializer 加载 ---
+    # 将模型/词典保存到临时文件，供 worker initializer 加载
     tmp_dir = tempfile.mkdtemp(prefix="lda_tmp_")
     lda_path = os.path.join(tmp_dir, "lda.model")
     dict_path = os.path.join(tmp_dir, "dict.gensim")
@@ -307,7 +276,7 @@ def build_restaurant_level_dataset_parallel(
             if buf:
                 yield (buf, category_cols)
 
-    # --- 主进程全局聚合容器（reduce） ---
+    # 主进程全局聚合容器（reduce）
     business_static: Dict[str, Dict[str, Any]] = {}
 
     sent_sum_pol = defaultdict(float)
@@ -331,10 +300,9 @@ def build_restaurant_level_dataset_parallel(
             chunk_generator(),
             chunksize=1
         ):
-            # scanned 只是近似（用于日志）
             scanned += chunk_size
 
-            # 合并静态字段（只保留一次）
+            # 合并静态字段
             for bid, st in static_map.items():
                 if bid not in business_static:
                     business_static[bid] = st
@@ -359,7 +327,7 @@ def build_restaurant_level_dataset_parallel(
                 elapsed = time.time() - t0
                 print(f"[AGG-P] scanned~{scanned:,}, unique_business={len(business_static):,}, elapsed={elapsed:.1f}s")
 
-    # --- 输出餐厅级 rows ---
+    # 输出餐厅级 rows
     rows = []
     for bid, static in business_static.items():
         n = sent_cnt.get(bid, 0)
@@ -382,10 +350,6 @@ def build_restaurant_level_dataset_parallel(
         rows.append(out)
 
     print(f"[DONE] restaurant_rows={len(rows):,}")
-
-    # （可选）清理临时文件夹：为了稳妥，这里不强制删除；你也可以手动删 tmp_dir
-    # 需要自动清理的话我可以再给你加 try/finally + shutil.rmtree
-
     return rows
 
 
@@ -395,15 +359,12 @@ def build_restaurant_level_dataset_parallel(
 def main():
     start = time.time()
 
-    # ===== 路径配置（改成你的文件名）=====
-    INPUT_MERGED_JSON = "餐厅整体评论数据.jsonl"  # 上一步输出：按行JSON（可以叫 .json）
-    # OUT_FEATURES_CSV = "restaurant_features.csv"
-    OUT_FEATURES_JSON = "restaurant_features.json"  # 按行JSON（扩展名用 .json）
+    INPUT_MERGED_JSON = r"task_two/数据预处理后数据.json"
+    OUT_FEATURES_JSON = "情感极性及主题建模后数据.json"
 
-    # OUT_TOPIC_WORDS_TXT = "lda_topic_words.txt"
-    OUT_TOPIC_WORDS_JSON = "lda_topic_words_3类_5轮_1.0.json"
+    OUT_TOPIC_WORDS_JSON = "主题词.json"
 
-    # ===== 可调参数 =====
+    # 可调参数
     TRAIN_RATIO = 1.0      # 1.0=100%；0.2=20%（随机抽样）
     SEED = 42
     NUM_TOPICS = 3
@@ -413,22 +374,21 @@ def main():
     NO_BELOW = 10
     NO_ABOVE = 0.5
     KEEP_N = 30000
-    MAX_DOCS_CAP = 0       # 0=不限制；>0 可限制训练文档数（防内存吃紧）
+    MAX_DOCS_CAP = 0       # 0=不限制；>0 可限制训练文档数
 
-    # 你原来叫 INFER_BATCH_SIZE，这里“无缝复用”为并行阶段 chunk_size（每个任务发给worker多少条review）
+    # 每个任务发给worker多少条review
     INFER_BATCH_SIZE = 10000
-
     # 并行 worker 数（0=自动 cpu-1）
     FEATURE_WORKERS = 0
 
-    # ===== 读取一条样本确定 cat__ 字段列表 =====
+    # 读取一条样本确定 cat__ 字段列表
     sample = next(iter_json_lines(INPUT_MERGED_JSON))
     if TEXT_FIELD not in sample:
         raise KeyError(f"输入数据缺少字段 {TEXT_FIELD}")
     category_cols = extract_category_columns(sample, prefix="cat__")
     print(f"[INFO] TEXT_FIELD={TEXT_FIELD}, category_cols={len(category_cols)}")
 
-    # ===== 1) 构造训练语料（流式 + 随机抽样）=====
+    # 1) 构造训练语料（流式 + 随机抽样）
     t0 = time.time()
     lda_texts = build_lda_training_texts(
         input_path=INPUT_MERGED_JSON,
@@ -439,7 +399,7 @@ def main():
     )
     print(f"[TIME] build training texts: {time.time() - t0:.1f}s")
 
-    # ===== 2) 训练 LDA（gensim 多核）=====
+    # 2) 训练 LDA（gensim 多核）=====
     t1 = time.time()
     lda, dictionary = train_lda_model(
         texts=lda_texts,
@@ -453,14 +413,13 @@ def main():
     )
     print(f"[TIME] train LDA: {time.time() - t1:.1f}s")
 
-    # ===== 3) 导出主题词（供人工判读）=====
+    # 3) 导出主题词（供人工判读）
     topic_words = get_topic_words(lda, topn=TOPN_WORDS)
-    # save_topic_words_txt(OUT_TOPIC_WORDS_TXT, topic_words)
     save_topic_words_json(OUT_TOPIC_WORDS_JSON, topic_words)
     print(f"[INFO] topic words saved: {OUT_TOPIC_WORDS_JSON}")
 
-    """
-    # ===== 4) 第二遍扫描（并行）：情感 + 主题 → 餐厅级聚合 =====
+
+    # 4) 第二遍扫描（并行）：情感 + 主题 → 餐厅级聚合
     t2 = time.time()
     restaurant_rows = build_restaurant_level_dataset_parallel(
         input_path=INPUT_MERGED_JSON,
@@ -472,23 +431,12 @@ def main():
     )
     print(f"[TIME] build restaurant features: {time.time() - t2:.1f}s")
 
-    
-    # ===== 5) 可选输出（你可在 main 中注释掉以减少运行时间）=====
-    base_fields = ["business_id", "price_range", "stars", "review_count", "latitude", "longitude"]
-    out_fields = base_fields + category_cols + [
-        "avg_sentiment_polarity", "avg_sentiment_subjectivity"
-    ] + [f"topic_{i}" for i in range(NUM_TOPICS)]
-    write_csv(OUT_FEATURES_CSV, restaurant_rows, out_fields)
-    
-
-    # 保存按行 JSON（扩展名用 .json）
     write_json_lines(OUT_FEATURES_JSON, restaurant_rows)
 
-    # print(f"[OUTPUT] {OUT_FEATURES_CSV}")
     print(f"[OUTPUT] {OUT_FEATURES_JSON}")
     print("[DONE] all finished.")
     print(f"[Total] 总运行时间: {time.time() - start:.2f} 秒")
-    """
+
 
 if __name__ == "__main__":
     main()
