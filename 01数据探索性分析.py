@@ -13,9 +13,8 @@ import matplotlib.pyplot as plt
 # ---------------------------
 # 工具函数
 # ---------------------------
-
 def split_categories(categories_str: str) -> List[str]:
-    """将 categories 字段按逗号拆分并去空格，保留原始文本。"""
+    """将 categories 字段按逗号拆分并去空格"""
     if not categories_str:
         return []
     return [c.strip() for c in categories_str.split(',') if c.strip()]
@@ -33,12 +32,9 @@ def has_exact_category(cats: Iterable[str], target: str) -> bool:
 
 
 def update_restaurants_cooccurrence(counter: Dict[str, int], cats_set: Set[str]) -> bool:
-    """以“商铺”为单位统计 Restaurants 与其它类别的共现次数。
-
-    - 仅当该商铺 categories 中存在独立的 'Restaurants'时触发。
-    - 对“其它类别”按类别字符串计数；每家店对每个类别只计 1 次（外部已用 set）。
-
-    返回：该商铺是否命中 Restaurants
+    """统计 Restaurants 与其它类别的共现次数
+    - 仅当商铺 categories 中存在独立的 'Restaurants'时触发。
+    - 对“其它类别”按类别字符串计数；每家店对每个类别只计 1 次
     """
     has_restaurants = False
     for c in cats_set:
@@ -63,15 +59,13 @@ def update_restaurants_cooccurrence(counter: Dict[str, int], cats_set: Set[str])
 # ---------------------------
 # 分块并行处理
 # ---------------------------
-
 def process_chunk(chunk_data: List[str]):
     """处理单个数据块，返回统计结果。
-
     返回：
       city_stats: {city: [total, open, latlon_abnormal, restaurants_count]}
       global_stats: [global_open, global_total]
       restaurants_cooccur: {category: count}
-      restaurants_total: 含 Restaurants 的商铺数量（Restaurants 精确匹配）
+      restaurants_total: 含 Restaurants 的商铺数量（精确匹配）
       category_counts: {category: shop_count}
     """
     city_stats = defaultdict(lambda: [0, 0, 0, 0])  # [总, 营业, 经纬度异常, categories含Restaurants]
@@ -213,9 +207,8 @@ def merge_results(results):
 
 
 # ---------------------------
-# 保存 & 可视化（封装函数）
+# 保存 & 可视化
 # ---------------------------
-
 def save_city_stats_csv(city_stats: Dict[str, List[int]],
                         global_open: int,
                         out_csv: str = '城市统计数据.csv'):
@@ -257,7 +250,6 @@ def save_restaurants_cooccurrence_csv(cooccur: Dict[str, int],
                                       restaurants_shop_total: int,
                                       out_csv: str = 'Restaurants共现类别.csv'):
     """保存 Restaurants 共现统计 CSV：类别名、共同出现次数、共现占比。
-
     共现占比(%) = 共同出现次数 / 含 Restaurants 的商铺数量 * 100
     """
     items = sorted(cooccur.items(), key=lambda x: x[1], reverse=True)
@@ -278,7 +270,7 @@ def plot_restaurants_cooccurrence_graph(cooccur: Dict[str, int],
                                         out_png: str,
                                         top_n: int = 40):
     """画 Restaurants 共现强度图。
-    - 圆点=类别（中心为 target_label）
+    - 圆点=类别
     - 连线粗细=共现次数（归一化映射到 linewidth）
     - 圆大小=共现次数（归一化映射到 scatter size）
     """
@@ -316,10 +308,10 @@ def plot_restaurants_cooccurrence_graph(cooccur: Dict[str, int],
     xs = [pos[l][0] for l in labels]
     ys = [pos[l][1] for l in labels]
 
-    sizes = [1400]  # 中心点固定更大
+    sizes = [1400]
     for _, w in items:
         if w_max > 0:
-            sizes.append(200 + 1800 * (w / w_max))  # 200~2000
+            sizes.append(200 + 1800 * (w / w_max))
         else:
             sizes.append(400)
 
@@ -342,10 +334,9 @@ def plot_restaurants_cooccurrence_graph(cooccur: Dict[str, int],
 # ---------------------------
 # main
 # ---------------------------
-
 def main(file_path: str,
          num_processes: int = None,
-         batch_size: int = 4,
+         batch_size: int = 8,
          chunk_size: int = 10000):
     start_time = time.time()
 
@@ -370,14 +361,14 @@ def main(file_path: str,
     print(f"categories 字段包含 Restaurants（精确匹配）的商铺数量: {rest_total}")
 
     # 城市统计 CSV
-    save_city_stats_csv(city_stats, global_open, out_csv='城市统计数据.csv')
+    save_city_stats_csv(city_stats, global_open, out_csv=r'task_one/城市统计数据.csv')
 
     # 类别统计 CSV
-    save_category_stats_csv(category_counts, out_csv='类别统计数据.csv')
+    save_category_stats_csv(category_counts, out_csv=r'task_one/类别统计数据.csv')
 
-    # Restaurants 共现（CSV + 图）
-    save_restaurants_cooccurrence_csv(rest_co, rest_total, out_csv='Restaurants共现类别.csv')
-    plot_restaurants_cooccurrence_graph(rest_co, target_label='Restaurants', out_png='Restaurants共现强度图.png', top_n=40)
+    # Restaurants 共现
+    save_restaurants_cooccurrence_csv(rest_co, rest_total, out_csv=r'task_one/Restaurants共现类别.csv')
+    plot_restaurants_cooccurrence_graph(rest_co, target_label='Restaurants', out_png=r'task_one/Restaurants共现强度图.png', top_n=40)
 
     end_time = time.time()
     print(f"\n总运行时间：{end_time - start_time:.2f} 秒")
