@@ -83,7 +83,7 @@ def build_lda_training_texts(
     max_docs_cap: int = 0,
 ) -> List[List[str]]:
     """
-    从全量 review 流式读取，按 Bernoulli 随机抽样得到训练文档集合。
+    从全量 review 流式读取，随机抽样得到训练文档集合
     - train_ratio: 1.0 表示100%，0.2 表示约20%
     - max_docs_cap: >0 时最多取这么多条（防止全量时内存吃紧）
     """
@@ -323,10 +323,6 @@ def build_restaurant_level_dataset_parallel(
             for bid, v in t_cnt.items():
                 topic_cnt[bid] += v
 
-            if scanned % 200000 == 0:
-                elapsed = time.time() - t0
-                print(f"[AGG-P] scanned~{scanned:,}, unique_business={len(business_static):,}, elapsed={elapsed:.1f}s")
-
     # 输出餐厅级 rows
     rows = []
     for bid, static in business_static.items():
@@ -349,7 +345,7 @@ def build_restaurant_level_dataset_parallel(
 
         rows.append(out)
 
-    print(f"[DONE] restaurant_rows={len(rows):,}")
+    print(f"[INFO] restaurant_rows={len(rows):,}")
     return rows
 
 
@@ -360,15 +356,15 @@ def main():
     start = time.time()
 
     INPUT_MERGED_JSON = r"task_two/数据预处理后数据.json"
-    OUT_FEATURES_JSON = "情感极性及主题建模后数据.json"
+    OUT_FEATURES_JSON = r"task_there/情感极性及主题建模后数据_抽样0.5.json"
 
-    OUT_TOPIC_WORDS_JSON = "主题词.json"
+    OUT_TOPIC_WORDS_JSON = r"task_there/LDA主题词_抽样0.5.json"
 
     # 可调参数
-    TRAIN_RATIO = 1.0      # 1.0=100%；0.2=20%（随机抽样）
+    TRAIN_RATIO = 0.5      # 1.0=100%；0.2=20%（随机抽样）
     SEED = 42
     NUM_TOPICS = 3
-    TOPN_WORDS = 15
+    TOPN_WORDS = 10
 
     PASSES = 5
     NO_BELOW = 10
@@ -386,7 +382,6 @@ def main():
     if TEXT_FIELD not in sample:
         raise KeyError(f"输入数据缺少字段 {TEXT_FIELD}")
     category_cols = extract_category_columns(sample, prefix="cat__")
-    print(f"[INFO] TEXT_FIELD={TEXT_FIELD}, category_cols={len(category_cols)}")
 
     # 1) 构造训练语料（流式 + 随机抽样）
     t0 = time.time()
@@ -397,9 +392,9 @@ def main():
         min_tokens=5,
         max_docs_cap=MAX_DOCS_CAP
     )
-    print(f"[TIME] build training texts: {time.time() - t0:.1f}s")
+    print(f"[TIME] 构建LDA训练语料: {time.time() - t0:.1f}s")
 
-    # 2) 训练 LDA（gensim 多核）=====
+    # 2) 训练 LDA（gensim 多核）
     t1 = time.time()
     lda, dictionary = train_lda_model(
         texts=lda_texts,
@@ -411,12 +406,12 @@ def main():
         no_above=NO_ABOVE,
         keep_n=KEEP_N
     )
-    print(f"[TIME] train LDA: {time.time() - t1:.1f}s")
+    print(f"[TIME] 训练LDA: {time.time() - t1:.1f}s")
 
     # 3) 导出主题词（供人工判读）
     topic_words = get_topic_words(lda, topn=TOPN_WORDS)
     save_topic_words_json(OUT_TOPIC_WORDS_JSON, topic_words)
-    print(f"[INFO] topic words saved: {OUT_TOPIC_WORDS_JSON}")
+    print(f"[INFO] 保存主题词为: {OUT_TOPIC_WORDS_JSON}")
 
 
     # 4) 第二遍扫描（并行）：情感 + 主题 → 餐厅级聚合
@@ -429,12 +424,12 @@ def main():
         chunk_size=INFER_BATCH_SIZE,
         workers=FEATURE_WORKERS
     )
-    print(f"[TIME] build restaurant features: {time.time() - t2:.1f}s")
+    print(f"[TIME] 构建餐厅特征变量: {time.time() - t2:.1f}s")
 
     write_json_lines(OUT_FEATURES_JSON, restaurant_rows)
 
-    print(f"[OUTPUT] {OUT_FEATURES_JSON}")
-    print("[DONE] all finished.")
+    print(f"[OUTPUT] 保存最终结果为：{OUT_FEATURES_JSON}")
+    print("[DONE] 全部完成")
     print(f"[Total] 总运行时间: {time.time() - start:.2f} 秒")
 
 
