@@ -349,6 +349,123 @@ def build_restaurant_level_dataset_parallel(
     return rows
 
 
+from collections import defaultdict
+from typing import Dict, Any, List
+import time
+
+def dense_topic_vector(lda, num_topics: int, bow) -> List[float]:
+    """把 lda.get_document_topics 的稀疏输出转成长度=num_topics 的稠密向量"""
+    dist = lda.get_document_topics(bow, minimum_probability=0.0)
+    vec = [0.0] * num_topics
+    for tid, p in dist:
+        vec[int(tid)] = float(p)
+    return vec
+
+
+def build_restaurant_level_dataset_streaming(
+    input_path: str,
+    lda,
+    dictionary,
+    category_cols: List[str],
+    log_every: int = 200000
+) -> List[Dict[str, Any]]:
+    """
+    纯流式第二遍扫描：
+    - 每读到一条 review 就立刻计算 sentiment + topic
+    - 直接累加到 business_id 的 sum/cnt
+    - 最后输出餐厅级均值特征
+    """
+    num_topics = int(lda.num_topics)
+
+    # 1) 餐厅静态字段（只保留一次）
+    business_static: Dict[str, Dict[str, Any]] = {}
+
+    # 2) 情感聚合 sum/cnt
+    sent_sum_pol = defaultdict(float)
+    sent_sum_sub = defaultdict(float)
+    sent_cnt = defaultdict(int)
+
+    # 3) 主题向量聚合 sum/cnt
+    topic_sum = defaultdict(lambda: [0.0] * num_topics)
+    topic_cnt = defaultdict(int)
+
+    scanned = 0
+    t0 = time.time()
+
+    for rec in iter_json_lines(input_path):
+        scanned += 1
+        bid = rec.get("business_id")
+        if not bid:
+            continue
+
+        # --- 静态字段：首次见到该 bid 时写入 ---
+        if bid not in business_static:
+            static = {
+                "business_id": bid,
+                "price_range": rec.get("price_range"),
+                "stars": rec.get("stars"),
+                "review_count": rec.get("review_count"),
+                "latitude": rec.get("latitude"),
+                "longitude": rec.get("longitude"),
+            }
+            for c in category_cols:
+                static[c] = rec.get(c, 0)
+            business_static[bid] = static
+
+        text = str(rec.get(TEXT_FIELD, ""))
+
+        # --- 情感：逐条计算 ---
+        try:
+            blob = TextBlob(text)
+            pol = float(blob.sentiment.polarity)
+            sub = float(blob.sentiment.subjectivity)
+        except Exception:
+            pol, sub = 0.0, 0.0
+
+        sent_sum_pol[bid] += pol
+        sent_sum_sub[bid] += sub
+        sent_cnt[bid] += 1
+
+        # --- 主题：逐条推断 ---
+        tokens = tokenize_for_lda(text)
+        bow = dictionary.doc2bow(tokens) if tokens else []
+        vec = dense_topic_vector(lda, num_topics, bow)
+
+        s = topic_sum[bid]
+        for i in range(num_topics):
+            s[i] += vec[i]
+        topic_cnt[bid] += 1
+
+        # --- 日志 ---
+        if log_every > 0 and scanned % log_every == 0:
+            dt = time.time() - t0
+            print(f"[STREAM] scanned={scanned:,} businesses={len(business_static):,} time={dt:.1f}s")
+
+    # 4) 输出餐厅级 rows（均值）
+    rows = []
+    for bid, static in business_static.items():
+        n = sent_cnt.get(bid, 0)
+        avg_pol = sent_sum_pol[bid] / n if n > 0 else 0.0
+        avg_sub = sent_sum_sub[bid] / n if n > 0 else 0.0
+
+        tc = topic_cnt.get(bid, 0)
+        if tc > 0:
+            avg_topic = [v / tc for v in topic_sum[bid]]
+        else:
+            avg_topic = [0.0] * num_topics
+
+        out = dict(static)
+        out["avg_sentiment_polarity"] = avg_pol
+        out["avg_sentiment_subjectivity"] = avg_sub
+        for i in range(num_topics):
+            out[f"topic_{i}"] = avg_topic[i]
+        rows.append(out)
+
+    print(f"[INFO] restaurant_rows={len(rows):,}")
+    return rows
+
+
+
 # =========================
 # main
 # =========================
@@ -416,14 +533,23 @@ def main():
 
     # 4) 第二遍扫描（并行）：情感 + 主题 → 餐厅级聚合
     t2 = time.time()
-    restaurant_rows = build_restaurant_level_dataset_parallel(
+    """restaurant_rows = build_restaurant_level_dataset_parallel(
         input_path=INPUT_MERGED_JSON,
         lda=lda,
         dictionary=dictionary,
         category_cols=category_cols,
         chunk_size=INFER_BATCH_SIZE,
         workers=FEATURE_WORKERS
+    )"""
+
+    restaurant_rows = build_restaurant_level_dataset_streaming(
+        input_path=INPUT_MERGED_JSON,
+        lda=lda,
+        dictionary=dictionary,
+        category_cols=category_cols,
+        log_every=200000
     )
+
     print(f"[TIME] 构建餐厅特征变量: {time.time() - t2:.1f}s")
 
     write_json_lines(OUT_FEATURES_JSON, restaurant_rows)
