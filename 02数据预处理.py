@@ -77,11 +77,10 @@ def clean_text(text):
     tokens = [w for w in text.split() if w not in STOPWORDS and len(w) > 1]
     return " ".join(tokens)
 
-def write_merged_json(out_path, rows_iter):
-    with open(out_path, "w", encoding="utf-8") as f:
-        for r in rows_iter:
+def write_jsonl(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
 
 # =========================
 # Business 并行处理
@@ -112,7 +111,6 @@ def process_business_chunk(lines):
         if not has_exact_restaurants(cats):
             continue
 
-        # price_range
         attrs = d.get("attributes") or {}
         pr = attrs.get("RestaurantsPriceRange2")
         pr_int = None
@@ -160,6 +158,17 @@ def chunk_reader(path, chunk_size=10000):
             yield chunk
 
 
+def batch_chunks(path, chunk_size, batch_size):
+    batch = []
+    for chunk in chunk_reader(path, chunk_size):
+        batch.append(chunk)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def preprocess_business_parallel(path, chunk_size=10000, n_proc=None):
     if n_proc is None:
         n_proc = max(1, cpu_count() - 1)
@@ -187,36 +196,60 @@ def preprocess_business_parallel(path, chunk_size=10000, n_proc=None):
 
 
 # =========================
-# Review → merge 生成器
+# Review 并行处理
 # =========================
-def iter_merged_reviews(review_path, business_map, business_id_set):
-    with open(review_path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
+def process_review_chunk(lines, business_map, business_id_set):
+    rows = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
 
-            bid = d.get("business_id")
-            if bid not in business_id_set:
-                continue
+        bid = d.get("business_id")
+        if bid not in business_id_set:
+            continue
 
-            b = business_map.get(bid)
-            if b is None:
-                continue
+        b = business_map.get(bid)
+        if b is None:
+            continue
 
-            yield {
-                "review_id": d.get("review_id"),
-                "text_clean": clean_text(d.get("text", "")),
-                **b
-            }
+        rows.append({
+            "review_id": d.get("review_id"),
+            "text_clean": clean_text(d.get("text", "")),
+            **b
+        })
+    return rows
+
+
+def process_reviews_parallel(review_path,
+                             business_map,
+                             business_id_set,
+                             chunk_size=10000,
+                             batch_size=4,
+                             n_proc=None):
+    if n_proc is None:
+        n_proc = max(1, cpu_count() - 1)
+
+    all_rows = []
+
+    with Pool(processes=n_proc) as pool:
+        for batch in batch_chunks(review_path, chunk_size, batch_size):
+            results = pool.starmap(
+                process_review_chunk,
+                [(chunk, business_map, business_id_set) for chunk in batch]
+            )
+            for part in results:
+                all_rows.extend(part)
+
+    return all_rows
 
 
 # =========================
 # main
 # =========================
 def main(business_path, review_path):
-    start_time = time.time()
+    start = time.time()
 
     business_map, business_id_set, mode_price = preprocess_business_parallel(
         business_path
@@ -225,14 +258,20 @@ def main(business_path, review_path):
     print(f"[Business] 餐厅数量: {len(business_map)}")
     print(f"[Business] price_range 众数: {mode_price}")
 
-    merged_iter = iter_merged_reviews(
-        review_path, business_map, business_id_set
+    t0 = time.time()
+    merged_rows = process_reviews_parallel(
+        review_path,
+        business_map,
+        business_id_set,
+        chunk_size=10000,
+        batch_size=4,
+        n_proc=max(1, cpu_count() - 1)
     )
-    write_merged_json(r"task_two/数据预处理后数据.json", merged_iter)
 
-    print("[Done] 合并数据处理完成")
-    print(f"结果已保存为：task_two/数据预处理后数据.json")
-    print(f"\n总运行时间：{time.time() - start_time:.2f} 秒")
+    write_jsonl(r"task_two\数据预处理后数据_并行.json", merged_rows)
+    print(f"结果已保存为：task_two\数据预处理后数据_并行.json")
+
+    print(f"[Total] 总运行时间: {time.time() - start:.2f} 秒")
 
 
 if __name__ == "__main__":
