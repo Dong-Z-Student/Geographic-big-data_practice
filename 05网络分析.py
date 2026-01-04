@@ -11,6 +11,7 @@ import geopandas as gpd
 from shapely.geometry import box, MultiPoint, LineString, MultiLineString
 from shapely.ops import unary_union
 
+import networkit as nk
 import networkx as nx
 import osmnx as ox
 
@@ -82,7 +83,7 @@ DRIVE_FALLBACK_SPEED_KMH = 30
 
 # =====stage3：中心性&到主干道距离=====
 # 预留参数：None 表示全节点计算中心性
-BC_K: Optional[int] = 1000
+BC_K: Optional[int] = None
 BC_SEED = 42
 
 
@@ -804,28 +805,119 @@ def _build_strip_nodes_from_osm_features(Gd: nx.MultiDiGraph,
     return sorted(strip_nodes)
 
 
+# def _compute_betweenness_centrality_drive(Gd: nx.MultiDiGraph,
+#                                          weight: str,
+#                                          k: Optional[int],
+#                                          seed: int,
+#                                          normalized: bool) -> Dict[int, float]:
+#     """
+#       - drive 图
+#       - weight=length
+#       - directed
+#       - normalized=False
+#       - k 参数预留：None => 全节点精确；否则采样近似
+#     """
+#     print("[S3-1] 在驾车路网上计算介数中心性(directed, weight=length, normalized=False)")
+#     # NetworkX 在 k=None 时不会用到 seed；k!=None 才会用到 seed
+#     try:
+#         bc = nx.betweenness_centrality(Gd, k=k, weight=weight, normalized=normalized, seed=seed)
+#     except TypeError:
+#         bc = nx.betweenness_centrality(Gd, k=k, weight=weight, normalized=normalized)
+#     out = {}
+#     for n, v in bc.items():
+#         try:
+#             out[int(n)] = float(v)
+#         except Exception:
+#             pass
+#     return out
+
+
 def _compute_betweenness_centrality_drive(Gd: nx.MultiDiGraph,
                                          weight: str,
                                          k: Optional[int],
                                          seed: int,
                                          normalized: bool) -> Dict[int, float]:
     """
-      - drive 图
-      - weight=length
-      - directed
-      - normalized=False
-      - k 参数预留：None => 全节点精确；否则采样近似
+    - 若 k is None：计算“精确” betweenness
+    - 若 k is not None：使用抽样估计，样本数 = k
     """
-    print("[S3-1] 在驾车路网上计算介数中心性(directed, weight=length, normalized=False)")
-    # NetworkX 在 k=None 时不会用到 seed；k!=None 才会用到 seed
-    try:
-        bc = nx.betweenness_centrality(Gd, k=k, weight=weight, normalized=normalized, seed=seed)
-    except TypeError:
-        bc = nx.betweenness_centrality(Gd, k=k, weight=weight, normalized=normalized)
-    out = {}
-    for n, v in bc.items():
+    nodes = list(Gd.nodes())
+    n = len(nodes)
+    node2idx = {int(node): i for i, node in enumerate(nodes)}
+    idx2node = nodes
+
+    # MultiDiGraph -> NetworKit Graph（保留每对(u,v)最小weight边）
+    best = {}  # (u_idx, v_idx) -> w_min
+    # 兼容 DiGraph / MultiDiGraph
+    if isinstance(Gd, (nx.MultiDiGraph, nx.MultiGraph)):
+        edge_iter = Gd.edges(keys=True, data=True)
+        for u, v, _k, data in edge_iter:
+            w = data.get(weight, None)
+            if w is None:
+                continue
+            try:
+                w = float(w)
+            except Exception:
+                continue
+            ui = node2idx.get(int(u), None)
+            vi = node2idx.get(int(v), None)
+            if ui is None or vi is None:
+                continue
+            key = (ui, vi)
+            prev = best.get(key, None)
+            if prev is None or w < prev:
+                best[key] = w
+    else:
+        edge_iter = Gd.edges(data=True)
+        for u, v, data in edge_iter:
+            w = data.get(weight, None)
+            if w is None:
+                continue
+            try:
+                w = float(w)
+            except Exception:
+                continue
+            ui = node2idx.get(int(u), None)
+            vi = node2idx.get(int(v), None)
+            if ui is None or vi is None:
+                continue
+            key = (ui, vi)
+            prev = best.get(key, None)
+            if prev is None or w < prev:
+                best[key] = w
+
+    nkG = nk.Graph(n, weighted=True, directed=True)
+    for (ui, vi), w in best.items():
+        nkG.addEdge(ui, vi, w)
+
+    print(f"[INFO] 加载了本地化路网: nodes={n:,}, edges={nkG.numberOfEdges():,}")
+
+    # 计算介数中心性
+    if k is None:
+        algo = nk.centrality.Betweenness(nkG, normalized=normalized, computeEdgeCentrality=False)
+    else:
+        if hasattr(nk.centrality, "EstimateBetweenness"):
+            try:
+                algo = nk.centrality.EstimateBetweenness(nkG, nSamples=int(k), normalized=normalized, seed=int(seed))
+            except TypeError:
+                algo = nk.centrality.EstimateBetweenness(nkG, nSamples=int(k), normalized=normalized)
+        elif hasattr(nk.centrality, "ApproxBetweenness"):
+            # ApproxBetweenness 用 epsilon 控制误差，k 越大，epsilon 越小
+            kk = max(50, int(k))
+            eps = float(max(0.02, min(0.20, 10.0 / np.sqrt(kk))))  # 经验映射
+            algo = nk.centrality.ApproxBetweenness(nkG, epsilon=eps)
+        else:
+            # 最后兜底：仍用精确
+            algo = nk.centrality.Betweenness(nkG, normalized=normalized, computeEdgeCentrality=False)
+
+    algo.run()
+    scores = algo.scores()
+    print(f"[S3-1] NetworKit介数中心性计算完成)")
+
+    out: Dict[int, float] = {}
+    for i, s in enumerate(scores):
         try:
-            out[int(n)] = float(v)
+            out[int(idx2node[i])] = float(s)
         except Exception:
             pass
     return out
