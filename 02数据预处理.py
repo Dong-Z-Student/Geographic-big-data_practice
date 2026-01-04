@@ -228,10 +228,10 @@ def main(business_path, review_path):
     merged_iter = iter_merged_reviews(
         review_path, business_map, business_id_set
     )
-    write_merged_json(r"task_two/数据预处理后数据.json", merged_iter)
+    write_merged_json(r"task2/数据预处理后数据.json", merged_iter)
 
     print("[Done] 合并数据处理完成")
-    print(f"结果已保存为：task_two/数据预处理后数据.json")
+    print(f"结果已保存为：task2/数据预处理后数据.json")
     print(f"\n总运行时间：{time.time() - start_time:.2f} 秒")
 
 

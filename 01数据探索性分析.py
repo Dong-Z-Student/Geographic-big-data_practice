@@ -361,14 +361,14 @@ def main(file_path: str,
     print(f"categories 字段包含 Restaurants（精确匹配）的商铺数量: {rest_total}")
 
     # 城市统计 CSV
-    save_city_stats_csv(city_stats, global_open, out_csv=r'task_one/城市统计数据.csv')
+    save_city_stats_csv(city_stats, global_open, out_csv=r'task1/城市统计数据.csv')
 
     # 类别统计 CSV
-    save_category_stats_csv(category_counts, out_csv=r'task_one/类别统计数据.csv')
+    save_category_stats_csv(category_counts, out_csv=r'task1/类别统计数据.csv')
 
     # Restaurants 共现
-    save_restaurants_cooccurrence_csv(rest_co, rest_total, out_csv=r'task_one/Restaurants共现类别.csv')
-    plot_restaurants_cooccurrence_graph(rest_co, target_label='Restaurants', out_png=r'task_one/Restaurants共现强度图.png', top_n=40)
+    save_restaurants_cooccurrence_csv(rest_co, rest_total, out_csv=r'task1/Restaurants共现类别.csv')
+    plot_restaurants_cooccurrence_graph(rest_co, target_label='Restaurants', out_png=r'task1/Restaurants共现强度图.png', top_n=40)
 
     end_time = time.time()
     print(f"\n总运行时间：{end_time - start_time:.2f} 秒")
