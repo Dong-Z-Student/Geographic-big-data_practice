@@ -32,12 +32,12 @@ UTM18N = "EPSG:32618"
 # 情感聚类参数
 SENT_EPS = 0.22
 SENT_MIN_SAMPLES = 8
-SENT_W = 5
+SENT_W = 10
 
 # 主题聚类参数
 TOPIC_EPS = 0.18
 TOPIC_MIN_SAMPLES = 6
-TOPIC_W = 5
+TOPIC_W = 10
 TOPIC_NAME_MAP = {
     "topic_0": "服务",
     "topic_1": "味道",
