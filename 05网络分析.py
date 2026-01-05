@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 # 基础配置
 # =========================
 # ====文件路径====
-INPUT_json = r"task3/情感极性及主题建模后数据.json"
+INPUT_json = r"task3/情感极性及主题建模后数据_抽样0.5.json"
 OUTPUT_json = r"task5/全特征变量数据.json"
 
 # ====研究区域====

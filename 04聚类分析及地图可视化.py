@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-04-A 聚类分析 + 地图可视化（标准化版本）
-改动点：
-1) 热点/冷点颜色对调：HOT=红色，COLD=蓝色（符合你的偏好）
-2) Stars 点图层改为 5 档颜色：0-1, 1-2, 2-3, 3-4, 4-5，并更新图例
-其余逻辑保持一致
-"""
-
 import json
 import numpy as np
 import pandas as pd
@@ -25,7 +17,7 @@ from jinja2 import Template
 
 
 # =========================
-# 参数区（你主要改这里）
+# 配置
 # =========================
 INPUT_FILE = "restaurant_features.json"   # 按行 JSON
 OUTPUT_MAP_HTML = "restaurant_spatial_analysis_std.html"

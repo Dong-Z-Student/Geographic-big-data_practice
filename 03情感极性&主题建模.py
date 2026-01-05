@@ -196,6 +196,7 @@ def _process_chunk(args):
         if bid not in static_map:
             static = {
                 "business_id": bid,
+                "avg_stars":rec.get("avg_stars"),
                 "price_range": rec.get("price_range"),
                 "stars": rec.get("stars"),
                 "review_count": rec.get("review_count"),
@@ -361,7 +362,7 @@ def main():
     OUT_TOPIC_WORDS_JSON = r"task3/LDA主题词_抽样0.5.json"
 
     # 可调参数
-    TRAIN_RATIO = 0.5      # 1.0=100%；0.2=20%（随机抽样）
+    TRAIN_RATIO = 0.5      # 1.0=100%；0.5=50%（随机抽样）
     SEED = 42
     NUM_TOPICS = 3
     TOPN_WORDS = 10

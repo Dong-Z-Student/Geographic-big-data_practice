@@ -189,7 +189,68 @@ def preprocess_business_parallel(path, chunk_size=10000, n_proc=None):
 # =========================
 # Review → merge 生成器
 # =========================
+# def iter_merged_reviews(review_path, business_map, business_id_set):
+#     with open(review_path, "r", encoding="utf-8") as f:
+#         for line in f:
+#             try:
+#                 d = json.loads(line)
+#             except Exception:
+#                 continue
+#
+#             bid = d.get("business_id")
+#             if bid not in business_id_set:
+#                 continue
+#
+#             b = business_map.get(bid)
+#             if b is None:
+#                 continue
+#
+#             yield {
+#                 "review_id": d.get("review_id"),
+#                 "text_clean": clean_text(d.get("text", "")),
+#                 **b
+#             }
+
+
 def iter_merged_reviews(review_path, business_map, business_id_set):
+    """
+    在同一个函数里完成：
+    1) 第1遍扫描 review：统计每个 business_id 的 avg_stars
+    2) 第2遍扫描 review：输出每条 review，并带上 avg_stars
+    main 不需要再单独调用统计函数
+    """
+    from collections import defaultdict
+
+    # -------- pass 1: compute avg_stars per business_id --------
+    sum_map = defaultdict(float)
+    cnt_map = defaultdict(int)
+
+    with open(review_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+
+            bid = d.get("business_id")
+            if bid not in business_id_set:
+                continue
+
+            s = d.get("stars")
+            try:
+                s = float(s)
+            except Exception:
+                continue
+
+            sum_map[bid] += s
+            cnt_map[bid] += 1
+
+    avg_stars_map = {}
+    for bid, ssum in sum_map.items():
+        c = cnt_map.get(bid, 0)
+        avg_stars_map[bid] = (ssum / c) if c > 0 else None
+
+    # -------- pass 2: yield merged rows --------
     with open(review_path, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -208,8 +269,11 @@ def iter_merged_reviews(review_path, business_map, business_id_set):
             yield {
                 "review_id": d.get("review_id"),
                 "text_clean": clean_text(d.get("text", "")),
+                "avg_stars": avg_stars_map.get(bid),  # NEW FIELD
                 **b
             }
+
+
 
 
 # =========================
