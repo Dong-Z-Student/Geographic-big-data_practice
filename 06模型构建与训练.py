@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import os
 from typing import List, Set, Tuple, Optional

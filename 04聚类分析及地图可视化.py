@@ -17,11 +17,11 @@ from jinja2 import Template
 
 
 # =========================
-# 配置
+# 基础配置
 # =========================
-INPUT_FILE = "restaurant_features.json"   # 按行 JSON
-OUTPUT_MAP_HTML = "restaurant_spatial_analysis_std.html"
-OUTPUT_CLUSTER_CSV = "restaurant_cluster_labels_std.csv"
+INPUT_FILE = r"task3/情感极性及主题建模后数据_抽样0.5.json"
+OUTPUT_MAP_HTML = r"task4/餐厅聚类分析地图.html"
+OUTPUT_CLUSTER_CSV = r"task4/餐厅聚类标签.csv"
 
 HOT_Q = 0.90
 COLD_Q = 0.10
@@ -29,27 +29,33 @@ COLD_Q = 0.10
 WGS84 = "EPSG:4326"
 UTM18N = "EPSG:32618"
 
-# —— 情感聚类参数（标准化后空间） —— #
+# 情感聚类参数
 SENT_EPS = 0.22
 SENT_MIN_SAMPLES = 8
 SENT_W = 5
 
-# —— 主题聚类参数（标准化后空间） —— #
+# 主题聚类参数
 TOPIC_EPS = 0.18
 TOPIC_MIN_SAMPLES = 6
 TOPIC_W = 5
+TOPIC_NAME_MAP = {
+    "topic_0": "服务",
+    "topic_1": "味道",
+    "topic_2": "菜品",
+}
 
-BUFFER_M_SENT = 100
-BUFFER_M_TOPIC = 100
+# 缓冲区设置
+BUFFER_M_SENT = 500
+BUFFER_M_TOPIC = 500
 
+# 热力图设置
 HEATMAP_RADIUS = 15
 HEATMAP_BLUR = 20
 
 POINT_RADIUS = 3
 
-
 # =========================
-# 工具：读取按行 JSON
+# 工具函数
 # =========================
 def load_json_lines(path: str) -> pd.DataFrame:
     rows = []
@@ -62,9 +68,6 @@ def load_json_lines(path: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# =========================
-# 投影：WGS84 -> UTM18N
-# =========================
 def project_to_utm18n(df: pd.DataFrame) -> pd.DataFrame:
     transformer = Transformer.from_crs(WGS84, UTM18N, always_xy=True)
     x, y = transformer.transform(df["longitude"].values, df["latitude"].values)
@@ -74,7 +77,7 @@ def project_to_utm18n(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# DBSCAN：标准化 + 第三维权重
+# DBSCAN聚类函数
 # =========================
 def run_weighted_dbscan_standardized(
     df: pd.DataFrame,
@@ -95,7 +98,7 @@ def run_weighted_dbscan_standardized(
 
 
 # =========================
-# polygon：buffer + union（输出 lon/lat GeoJSON）
+# 绘图工具函数
 # =========================
 def build_buffered_polygons_lonlat(
     df: pd.DataFrame,
@@ -136,6 +139,40 @@ def build_buffered_polygons_lonlat(
     return polygons
 
 
+def build_merged_region_polygons_lonlat(
+    df: pd.DataFrame,
+    cluster_col: str,
+    buffer_m: float,
+    target_cids: set,
+) -> list:
+    if not target_cids:
+        return []
+
+    sub = df[df[cluster_col].isin(list(target_cids))].copy()
+    if sub.empty:
+        return []
+
+    buffers = [Point(x, y).buffer(buffer_m) for x, y in zip(sub["x_utm"], sub["y_utm"])]
+    merged = unary_union(buffers)
+    if merged.is_empty:
+        return []
+
+    if merged.geom_type == "Polygon":
+        geoms = [merged]
+    elif merged.geom_type == "MultiPolygon":
+        geoms = list(merged.geoms)
+    else:
+        return []
+
+    transformer_back = Transformer.from_crs(UTM18N, WGS84, always_xy=True)
+
+    def poly_to_geojson(poly):
+        coords = [transformer_back.transform(x, y) for x, y in poly.exterior.coords]
+        return {"type": "Polygon", "coordinates": [coords]}
+
+    return [poly_to_geojson(g) for g in geoms]
+
+
 def cluster_mean(df: pd.DataFrame, cluster_col: str, value_col: str) -> pd.Series:
     sub = df[df[cluster_col] != -1]
     if sub.empty:
@@ -168,7 +205,7 @@ def make_style(color: str, fill_opacity: float = 0.25):
 
 
 # =========================
-# Stars 分级（5档）+ 图例
+# 图例
 # =========================
 def stars_to_color_5bin(stars: float) -> str:
     """
@@ -215,13 +252,13 @@ class StarLegend5Bin(MacroElement):
 
 
 # =========================
-# 主流程
+# main
 # =========================
 def main():
-    print("[LOAD] reading data...")
+    print("[LOAD] 读取数据")
     df = load_json_lines(INPUT_FILE)
 
-    must = ["business_id", "latitude", "longitude", "stars", "avg_sentiment_polarity"]
+    must = ["business_id", "latitude", "longitude", "avg_stars", "avg_sentiment_polarity"]
     for c in must:
         if c not in df.columns:
             raise KeyError(f"输入缺少字段：{c}")
@@ -230,12 +267,16 @@ def main():
         [c for c in df.columns if c.startswith("topic_") and c.split("_")[1].isdigit()],
         key=lambda x: int(x.split("_")[1])
     )
-    print(f"[INFO] topics detected: {topic_cols}")
+
+    # 三个主题（服务/味道/菜品）
+    topic_cols = [t for t in topic_cols if t in TOPIC_NAME_MAP]
+    print(f"[INFO] 主题字段如下: {topic_cols}")
+    print(f"[INFO] 主题映射如下: { {t: TOPIC_NAME_MAP[t] for t in topic_cols} }")
 
     df = project_to_utm18n(df)
 
-    # ========= 情感聚类 =========
-    print("[CLUSTER] sentiment DBSCAN...")
+    # 情感聚类
+    print("[CLUSTER] 情感聚类")
     df["sentiment_cluster"] = run_weighted_dbscan_standardized(
         df,
         value_col="avg_sentiment_polarity",
@@ -246,22 +287,24 @@ def main():
 
     sent_mean = cluster_mean(df, "sentiment_cluster", "avg_sentiment_polarity")
     sent_hot, sent_cold, sent_hot_thr, sent_cold_thr = select_hot_cold_clusters(sent_mean, HOT_Q, COLD_Q)
-    print(f"[SENT] clusters={len(sent_mean)}, hot={len(sent_hot)}, cold={len(sent_cold)}, "
-          f"hot_thr={sent_hot_thr}, cold_thr={sent_cold_thr}")
+    print(f"[SENT] 聚类数：{len(sent_mean)}, 热点数：{len(sent_hot)}, 冷点数：{len(sent_cold)}, "
+          f"热点阈值：{sent_hot_thr}, 冷点阈值：{sent_cold_thr}")
 
-    sent_polys_all = build_buffered_polygons_lonlat(df, "sentiment_cluster", BUFFER_M_SENT)
-    sent_polys_hot = {cid: geo for cid, geo in sent_polys_all.items() if cid in sent_hot}
-    sent_polys_cold = {cid: geo for cid, geo in sent_polys_all.items() if cid in sent_cold}
+    # 合并
+    sent_hot_geos = build_merged_region_polygons_lonlat(df, "sentiment_cluster", BUFFER_M_SENT, sent_hot)
+    sent_cold_geos = build_merged_region_polygons_lonlat(df, "sentiment_cluster", BUFFER_M_SENT, sent_cold)
 
-    # ========= 主题聚类 =========
+    # 主题聚类
     topic_polys_hotcold = {}
     for t in topic_cols:
+        topic_name = TOPIC_NAME_MAP.get(t, t)
+
         aspect_col = f"{t}_aspect"
         cluster_col = f"{t}_cluster"
 
         df[aspect_col] = df[t].astype(float) * df["avg_sentiment_polarity"].astype(float)
 
-        print(f"[CLUSTER] {t} DBSCAN...")
+        print(f"[CLUSTER] 主题 {topic_name} ({t}) 聚类")
         df[cluster_col] = run_weighted_dbscan_standardized(
             df,
             value_col=aspect_col,
@@ -272,31 +315,31 @@ def main():
 
         mean_aspect = cluster_mean(df, cluster_col, aspect_col)
         hot_cids, cold_cids, hot_thr, cold_thr = select_hot_cold_clusters(mean_aspect, HOT_Q, COLD_Q)
-        print(f"[{t}] clusters={len(mean_aspect)}, hot={len(hot_cids)}, cold={len(cold_cids)}, "
-              f"hot_thr={hot_thr}, cold_thr={cold_thr}")
+        print(f"[{topic_name}/{t}] 聚类数：{len(mean_aspect)}, 热点数：{len(hot_cids)}, 冷点数：{len(cold_cids)}, "
+              f"热点阈值：{hot_thr}, 冷点阈值：{cold_thr}")
 
-        polys_all = build_buffered_polygons_lonlat(df, cluster_col, BUFFER_M_TOPIC)
-        polys_hot = {cid: geo for cid, geo in polys_all.items() if cid in hot_cids}
-        polys_cold = {cid: geo for cid, geo in polys_all.items() if cid in cold_cids}
+        # 合并
+        hot_merged = build_merged_region_polygons_lonlat(df, cluster_col, BUFFER_M_TOPIC, hot_cids)
+        cold_merged = build_merged_region_polygons_lonlat(df, cluster_col, BUFFER_M_TOPIC, cold_cids)
 
         topic_polys_hotcold[t] = {
-            "hot": polys_hot,
-            "cold": polys_cold,
+            "topic_name": topic_name,
+            "hot": hot_merged,
+            "cold": cold_merged,
             "mean_aspect": mean_aspect,
             "hot_thr": hot_thr,
             "cold_thr": cold_thr,
         }
 
     # ========= 地图 =========
-    print("[MAP] building folium map...")
+    print("[MAP] 绘制地图")
     center = [float(df["latitude"].mean()), float(df["longitude"].mean())]
     m = folium.Map(location=center, zoom_start=12, tiles="CartoDB positron")
 
-    # 新的 5 档星级图例
     m.get_root().add_child(StarLegend5Bin())
 
-    # a) 点图层：stars 5 档着色
-    fg_points = folium.FeatureGroup(name="Restaurants (Stars)")
+    # 点图层：stars 5 档着色
+    fg_points = folium.FeatureGroup(name="餐厅点位", show=True)
     for _, r in df.iterrows():
         stars = float(r["stars"])
         color = stars_to_color_5bin(stars)
@@ -311,8 +354,8 @@ def main():
         ).add_to(fg_points)
     fg_points.add_to(m)
 
-    # b) 情感热力图层
-    fg_heat = folium.FeatureGroup(name="Sentiment Heatmap")
+    # 情感热力图层
+    fg_heat = folium.FeatureGroup(name="情感分析热力图层", show=False)
     HeatMap(
         data=df[["latitude", "longitude", "avg_sentiment_polarity"]].values.tolist(),
         radius=HEATMAP_RADIUS,
@@ -320,61 +363,61 @@ def main():
     ).add_to(fg_heat)
     fg_heat.add_to(m)
 
-    # c) 情感热点/冷点：按你的要求 HOT=红，COLD=蓝
-    fg_sent = folium.FeatureGroup(name="Sentiment Hot/Cold (Top10%/Bottom10%)")
+    # 情感热点/冷点
+    fg_sent = folium.FeatureGroup(name="情感热点/冷点区域", show=False)
     hot_style = make_style("red", fill_opacity=0.25)
     cold_style = make_style("blue", fill_opacity=0.25)
 
-    for cid, geo in sent_polys_hot.items():
-        mean_v = float(sent_mean.get(cid, 0.0))
+    for geo in sent_hot_geos:
         folium.GeoJson(
             data=geo,
             style_function=hot_style,
-            tooltip=f"HOT sent_cluster={cid}, mean_sent={mean_v:.3f}",
+            tooltip="情感 热点",
         ).add_to(fg_sent)
 
-    for cid, geo in sent_polys_cold.items():
-        mean_v = float(sent_mean.get(cid, 0.0))
+    for geo in sent_cold_geos:
         folium.GeoJson(
             data=geo,
             style_function=cold_style,
-            tooltip=f"COLD sent_cluster={cid}, mean_sent={mean_v:.3f}",
+            tooltip="情感 冷点",
         ).add_to(fg_sent)
 
     fg_sent.add_to(m)
 
-    # d) 主题图层：同样 HOT=红，COLD=蓝
+    # 主题图层
     for t, pack in topic_polys_hotcold.items():
-        fg_t = folium.FeatureGroup(name=f"{t} Hot/Cold (Top10%/Bottom10%)")
-        mean_aspect = pack["mean_aspect"]
+        topic_name = pack.get("topic_name", t)
+        fg_t = folium.FeatureGroup(name=f"主题：{topic_name} 热点/冷点区域", show=False)
 
-        for cid, geo in pack["hot"].items():
-            mv = float(mean_aspect.get(cid, 0.0))
+        for geo in pack["hot"]:
             folium.GeoJson(
                 data=geo,
                 style_function=hot_style,
-                tooltip=f"HOT {t}_cluster={cid}, mean_aspect={mv:.3f}",
+                tooltip=f"{topic_name} 热点",
             ).add_to(fg_t)
 
-        for cid, geo in pack["cold"].items():
-            mv = float(mean_aspect.get(cid, 0.0))
+        for geo in pack["cold"]:
             folium.GeoJson(
                 data=geo,
                 style_function=cold_style,
-                tooltip=f"COLD {t}_cluster={cid}, mean_aspect={mv:.3f}",
+                tooltip=f"{topic_name} 冷点",
             ).add_to(fg_t)
 
         fg_t.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
     m.save(OUTPUT_MAP_HTML)
-    print(f"[DONE] map saved -> {OUTPUT_MAP_HTML}")
+    print(f"[DONE] 地图已保存为 {OUTPUT_MAP_HTML}")
 
-    # ========= 输出 CSV =========
+    # 输出 CSV
     out_cols = ["business_id", "sentiment_cluster"] + [f"{t}_cluster" for t in topic_cols]
     out_df = df[out_cols].copy()
+
+    rename_map = {f"{t}_cluster": f"{TOPIC_NAME_MAP.get(t, t)}_cluster" for t in topic_cols}
+    out_df = out_df.rename(columns=rename_map)
+
     out_df.to_csv(OUTPUT_CLUSTER_CSV, index=False, encoding="utf-8")
-    print(f"[DONE] csv saved -> {OUTPUT_CLUSTER_CSV}")
+    print(f"[DONE] 聚类文件已保存为 {OUTPUT_CLUSTER_CSV}")
 
 
 if __name__ == "__main__":
