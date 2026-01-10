@@ -1,723 +1,279 @@
+# -*- coding: utf-8 -*-
 import json
 import pandas as pd
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 import warnings
+
 import geopandas as gpd
-from shapely.geometry import Point
+from shapely.geometry import Point, MultiPoint
+
 import networkx as nx
 import osmnx as ox
+
 import random
 import numpy as np
 import os
 
-# =========================
-# 设置随机种子
-# =========================
+
 def set_global_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 set_global_seed(42)
-
-
 warnings.filterwarnings("ignore")
 
 # =========================
 # 基础配置
 # =========================
-INPUT_JSON = r"task5/全特征变量数据.json"         # 训练数据特征文件
-VIRTUAL_CSV = r"task7/虚拟餐厅.csv"              # 虚拟餐厅CSV文件
-OUTPUT_VIRTUAL_JSON = r"task7/虚拟餐厅特征.json"  # 虚拟餐厅特征输出
-PREDICTION_OUTPUT = r"task7/虚拟餐厅预测星级.csv"  # 预测结果输出
+INPUT_JSON = r"task5/全特征变量数据.json"
+VIRTUAL_CSV = r"task7/虚拟餐厅.csv"
+OUTPUT_VIRTUAL_JSON = r"task7/虚拟餐厅特征.json"
+PREDICTION_OUTPUT = r"task7/虚拟餐厅预测星级.csv"
 
-PLACE_NAME = "Philadelphia, Pennsylvania, USA"
 TARGET_CRS = "EPSG:32618"
 WALK_SPEED_KMH = 4.8
 WALK_TIME_SECONDS = 600
 DRIVE_TIME_SECONDS = 900
 
-# 路径设置
-OSMNX_CACHE_DIR = "./cache"
-LOCAL_GRAPH_DIR = "./local_graph"
-LOCAL_WALK_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_walk_clipped_utm18_slim.graphml")
-LOCAL_DRIVE_GRAPHML_PATH = os.path.join(LOCAL_GRAPH_DIR, "philadelphia_drive_clipped_utm18_slim.graphml")
+LOCAL_WALK_GRAPHML_PATH = "./local_graph/philadelphia_walk_clipped_utm18_slim.graphml"
+LOCAL_DRIVE_GRAPHML_PATH = "./local_graph/philadelphia_drive_clipped_utm18_slim.graphml"
 
+PHILADELPHIA_BOUNDS = {
+    'min_lon': -75.28, 'max_lon': -74.96,
+    'min_lat': 39.86, 'max_lat': 40.14
+}
 
 # =========================
 # 工具函数
 # =========================
-def print_debug_info(title, data_dict):
-    """打印调试信息"""
-    print(f"\n{'=' * 50}")
-    print(f"DEBUG: {title}")
-    print('=' * 50)
-    for key, value in data_dict.items():
-        print(f"  {key}: {value}")
+def fix_coordinate_columns(df):
+    if 'longitude' not in df.columns or 'latitude' not in df.columns:
+        return df
+
+    lon = df.iloc[0]['longitude']
+    lat = df.iloc[0]['latitude']
+    if 30 <= lon <= 50 and abs(lat) > 50:
+        df = df.rename(columns={'longitude': 'latitude_temp', 'latitude': 'longitude_temp'})
+        df = df.rename(columns={'latitude_temp': 'latitude', 'longitude_temp': 'longitude'})
+    return df
+
+
+def validate_coordinates(df):
+    for _, r in df.iterrows():
+        lat, lon = r['latitude'], r['longitude']
+        if not (PHILADELPHIA_BOUNDS['min_lat'] <= lat <= PHILADELPHIA_BOUNDS['max_lat']):
+            return False
+        if not (PHILADELPHIA_BOUNDS['min_lon'] <= lon <= PHILADELPHIA_BOUNDS['max_lon']):
+            return False
+    return True
 
 
 def map_virtual_type_to_categories(virtual_type, all_categories):
-    """将虚拟餐厅的类型映射到现有餐厅的类别"""
-    type_lower = str(virtual_type).lower().strip()
-
-    # 常见类型映射
-    type_mapping = {
-        'french': ['french'],
-        'japanese': ['japanese', 'sushi'],
-        'mexican': ['mexican'],
-        'thai': ['thai'],
-        'burgers': ['burgers'],
+    type_lower = str(virtual_type).lower()
+    mapping = {
         'italian': ['italian'],
+        'japanese': ['japanese', 'sushi'],
         'chinese': ['chinese'],
-        'american': ['american', 'american_traditional', 'american_new'],
-        'pizza': ['pizza'],
-        'sandwiches': ['sandwiches'],
-        'bars': ['bars'],
-        'seafood': ['seafood'],
-        'coffee': ['coffee_&_tea'],
-        'breakfast': ['breakfast_&_brunch'],
-        'fast food': ['fast_food'],
-        'salad': ['salad']
+        'mexican': ['mexican'],
+        'american': ['american', 'american_traditional'],
+        'pizza': ['pizza']
     }
 
-    # 查找匹配的类别
-    matched_categories = []
+    matched = []
+    for k, v in mapping.items():
+        if k in type_lower:
+            for c in v:
+                col = f"cat__{c}"
+                if col in all_categories:
+                    matched.append(col)
 
-    # 首先检查是否有直接映射
-    for key, values in type_mapping.items():
-        if key in type_lower:
-            for value in values:
-                cat_name = f"cat__{value.replace(' ', '_')}"
-                if cat_name in all_categories:
-                    matched_categories.append(cat_name)
-
-    # 如果没有找到直接映射，尝试模糊匹配
-    if not matched_categories:
-        for cat in all_categories:
-            cat_clean = cat.replace('cat__', '').replace('_', ' ').lower()
-            if type_lower in cat_clean or any(word in cat_clean for word in type_lower.split()):
-                matched_categories.append(cat)
-
-    # 如果还是没有找到，使用默认类别
-    if not matched_categories and all_categories:
-        matched_categories = [all_categories[0]]
-
-    return matched_categories
+    return matched if matched else all_categories[:1]
 
 
+# =========================
+# 数据加载
+# =========================
 def load_and_prepare_existing_data():
-    """加载和准备现有餐厅数据"""
-    print("\n[INFO] 加载现有餐厅数")
+    rows = []
+    with open(INPUT_JSON, "r", encoding="utf-8") as f:
+        for line in f:
+            rows.append(json.loads(line))
 
-    try:
-        # 加载特征文件
-        rows = []
-        with open(INPUT_JSON, "r", encoding="utf-8") as f:
-            for line in f:
-                rows.append(json.loads(line))
-
-        df_existing = pd.DataFrame(rows)
-
-        print_debug_info("现有数据基本信息", {
-            "总行数": len(df_existing),
-            "列数": len(df_existing.columns),
-            "前20列": list(df_existing.columns)[:20]
-        })
-
-        # 检查关键字段
-        key_fields = ['stars', 'latitude', 'longitude', 'price_range',
-                      'walkability_score', 'competitor_density',
-                      'drive_accessibility_score', 'avg_sentiment_polarity']
-
-        field_analysis = {}
-        for field in key_fields:
-            if field in df_existing.columns:
-                non_null = df_existing[field].notna().sum()
-                unique = df_existing[field].nunique()
-                field_analysis[field] = {
-                    "存在": "是",
-                    "非空数量": non_null,
-                    "唯一值数量": unique,
-                    "示例值": df_existing[field].iloc[0] if non_null > 0 else "空"
-                }
-            else:
-                field_analysis[field] = {"存在": "否"}
-
-        print_debug_info("关键字段分析", field_analysis)
-
-        # 检查stars分布
-        if 'stars' in df_existing.columns:
-            stars_stats = df_existing['stars'].describe()
-            print_debug_info("Stars分布统计", {
-                "平均值": stars_stats['mean'],
-                "标准差": stars_stats['std'],
-                "最小值": stars_stats['min'],
-                "25%分位数": stars_stats['25%'],
-                "中位数": stars_stats['50%'],
-                "75%分位数": stars_stats['75%'],
-                "最大值": stars_stats['max'],
-            })
-
-        # 检查类别字段
-        cat_cols = [c for c in df_existing.columns if c.startswith('cat__')]
-        print_debug_info("类别字段", {
-            "数量": len(cat_cols),
-            "前10个": cat_cols[:10] if cat_cols else "无"
-        })
-
-        return df_existing, cat_cols
-
-    except Exception as e:
-        print(f"[ERROR] 加载现有数据失败: {e}")
-        raise
+    df = pd.DataFrame(rows)
+    cat_cols = [c for c in df.columns if c.startswith("cat__")]
+    return df, cat_cols
 
 
 def load_and_fix_virtual_restaurants():
-    """加载并修复虚拟餐厅数据"""
-    print("\n[INFO] 加载虚拟餐厅数据")
+    df = pd.read_csv(VIRTUAL_CSV)
+    df = fix_coordinate_columns(df)
 
-    if not os.path.exists(VIRTUAL_CSV):
-        print(f"[ERROR] 虚拟餐厅文件不存在: {VIRTUAL_CSV}")
+    if not validate_coordinates(df):
+        raise ValueError("虚拟餐厅坐标不在费城范围内")
 
-        # 创建示例虚拟餐厅数据
-        print("[INFO] 创建示例虚拟餐厅数据")
-        sample_data = {
-            'id': ['VR001', 'VR002', 'VR003', 'VR004', 'VR005'],
-            'longitude': [-75.1652, -75.1500, -75.1350, -75.1200, -75.1050],
-            'latitude': [39.9526, 39.9600, 39.9450, 39.9300, 39.9150],
-            'price_range': [1, 2, 3, 4, 2],
-            'type': ['Italian', 'Japanese', 'Chinese', 'Mexican', 'American'],
-            'remarks': ['示例餐厅1', '示例餐厅2', '示例餐厅3', '示例餐厅4', '示例餐厅5']
-        }
-
-        df_virtual = pd.DataFrame(sample_data)
-        df_virtual.to_csv(VIRTUAL_CSV, index=False, encoding='utf-8')
-        print(f"[INFO] 示例数据已保存到: {VIRTUAL_CSV}")
-        return df_virtual
-
-    # 加载CSV文件
-    try:
-        df_virtual = pd.read_csv(VIRTUAL_CSV, encoding='utf-8')
-    except:
-        try:
-            df_virtual = pd.read_csv(VIRTUAL_CSV, encoding='gbk')
-        except:
-            df_virtual = pd.read_csv(VIRTUAL_CSV, encoding='latin1')
-
-    print_debug_info("原始虚拟餐厅数据", {
-        "餐厅数量": len(df_virtual),
-        "列名": list(df_virtual.columns),
-        "前几行数据": df_virtual.head().to_dict('records')
-    })
-
-    return df_virtual
+    return df
 
 
+# =========================
+# 特征计算
+# =========================
 def calculate_features_for_virtual_restaurants(df_virtual, df_existing, cat_cols):
-    """为虚拟餐厅计算特征"""
-    print("\n[INFO] 计算虚拟餐厅特征")
 
-    # =========================
-    # 加载路网图
-    # =========================
-    print("[INFO] 加载路网图")
+    G_walk = ox.load_graphml(LOCAL_WALK_GRAPHML_PATH)
+    G_drive = ox.load_graphml(LOCAL_DRIVE_GRAPHML_PATH)
 
-    def _coerce_edge_attr_to_float(G, attr):
-        if G is None:
-            return
-        for _, _, _, data in G.edges(keys=True, data=True):
-            if attr not in data:
-                continue
-            v = data.get(attr, None)
-            if v is None:
-                continue
-            if isinstance(v, (int, float, np.integer, np.floating)):
-                continue
-            try:
-                data[attr] = float(v)
-            except Exception:
-                data[attr] = np.nan
-
-    def load_graph_if_exists(graphml_path: str):
-        """从本地加载图"""
-        if graphml_path and os.path.exists(graphml_path):
-            print(f"[INFO] 加载本地图: {graphml_path}")
-            G = ox.load_graphml(graphml_path)
-
-            try:
-                any_node = next(iter(G.nodes))
-                if isinstance(any_node, str) and any_node.isdigit():
-                    mapping = {n: int(n) for n in G.nodes if isinstance(n, str) and n.isdigit()}
-                    if len(mapping) == len(G.nodes):
-                        G = nx.relabel_nodes(G, mapping, copy=True)
-            except Exception:
-                pass
-
-            fname = os.path.basename(graphml_path).lower()
-            if "walk" in fname:
-                _coerce_edge_attr_to_float(G, "travel_time")
-            if "drive" in fname:
-                _coerce_edge_attr_to_float(G, "drive_time")
-                _coerce_edge_attr_to_float(G, "length")
-
-            print(f"[INFO] 加载完成: 节点={len(G.nodes):,}, 边={len(G.edges):,}")
-            return G
-        else:
-            print(f"[ERROR] 图文件不存在: {graphml_path}")
-            return None
-
-    # 加载walk图
-    G_walk = load_graph_if_exists(LOCAL_WALK_GRAPHML_PATH)
-    if G_walk is None:
-        print("[ERROR] Walk图不存在，请先运行05网络分析.py生成路网")
-        return None
-
-    # 加载drive图
-    G_drive = load_graph_if_exists(LOCAL_DRIVE_GRAPHML_PATH)
-    if G_drive is None:
-        print("[ERROR] Drive图不存在，请先运行05网络分析.py生成路网")
-        return None
-
-    # 检查drive图是否有drive_time权重
-    has_drive_time = False
-    for _, _, _, data in G_drive.edges(keys=True, data=True):
-        if "drive_time" in data and data["drive_time"] is not None:
-            has_drive_time = True
-            break
-
-    if not has_drive_time:
-        print("[WARN] Drive图缺少drive_time权重，尝试重新计算")
-        DRIVE_DEFAULT_SPEED_KMH = {
-            "motorway": 100,
-            "motorway_link": 60,
-            "trunk": 80,
-            "trunk_link": 50,
-            "primary": 60,
-            "primary_link": 45,
-            "secondary": 50,
-            "secondary_link": 40,
-            "tertiary": 40,
-            "tertiary_link": 35,
-            "residential": 30,
-            "unclassified": 30,
-            "living_street": 15,
-            "service": 20,
-            "road": 30,
-        }
-        DRIVE_FALLBACK_SPEED_KMH = 30
-
-        def _pick_highway_value(highway_attr):
-            if highway_attr is None:
-                return None
-            if isinstance(highway_attr, (list, tuple)) and len(highway_attr) > 0:
-                return str(highway_attr[0])
-            return str(highway_attr)
-
-        def _parse_maxspeed_to_kmh(maxspeed_attr):
-            """尝试解析 OSM maxspeed"""
-            if maxspeed_attr is None:
-                return None
-
-            candidates = []
-            if isinstance(maxspeed_attr, (list, tuple)):
-                candidates = [str(x) for x in maxspeed_attr if x is not None]
-            else:
-                candidates = [str(maxspeed_attr)]
-
-            parsed_vals = []
-            for s in candidates:
-                s2 = s.strip().lower()
-                if not s2:
-                    continue
-                if any(tok in s2 for tok in ["signals", "variable", "none", "walk", "national", "urban", "rural"]):
-                    continue
-
-                import re
-                nums = re.findall(r"(\d+(\.\d+)?)", s2)
-                if not nums:
-                    continue
-                v = float(nums[0][0])
-
-                if "mph" in s2:
-                    v = v * 1.609344
-                parsed_vals.append(v)
-
-            if not parsed_vals:
-                return None
-            return float(min(parsed_vals))
-
-        def add_drive_time_to_edges(G, default_speed_map_kmh, fallback_speed_kmh):
-            """为drive图的每条边添加drive_time（秒）"""
-            for u, v, k, data in G.edges(keys=True, data=True):
-                length_m = data.get("length", None)
-                if length_m is None:
-                    data["drive_time"] = np.nan
-                    continue
-
-                ms = _parse_maxspeed_to_kmh(data.get("maxspeed", None))
-                if ms is None or ms <= 0:
-                    hw = _pick_highway_value(data.get("highway", None))
-                    ms = default_speed_map_kmh.get(hw, None)
-                if ms is None or ms <= 0:
-                    ms = float(fallback_speed_kmh)
-
-                meters_per_sec = (ms * 1000.0) / 3600.0
-                data["drive_time"] = float(length_m) / meters_per_sec
-
-        # 计算drive_time
-        add_drive_time_to_edges(G_drive, DRIVE_DEFAULT_SPEED_KMH, DRIVE_FALLBACK_SPEED_KMH)
-        print("[INFO] 已重新计算drive_time权重")
-
-    # =========================
-    # 转换坐标系统
-    # =========================
-    print("[INFO] 转换坐标系统")
-
-    # 虚拟餐厅的GeoDataFrame
     gdf_virtual = gpd.GeoDataFrame(
-        df_virtual.copy(),
-        geometry=gpd.points_from_xy(df_virtual["longitude"], df_virtual["latitude"]),
+        df_virtual,
+        geometry=gpd.points_from_xy(df_virtual.longitude, df_virtual.latitude),
         crs="EPSG:4326"
     ).to_crs(TARGET_CRS)
 
-    # 现有餐厅的GeoDataFrame
     gdf_existing = gpd.GeoDataFrame(
-        df_existing.copy(),
-        geometry=gpd.points_from_xy(df_existing["longitude"], df_existing["latitude"]),
+        df_existing,
+        geometry=gpd.points_from_xy(df_existing.longitude, df_existing.latitude),
         crs="EPSG:4326"
     ).to_crs(TARGET_CRS)
 
     features_list = []
 
-    for i, virtual_row in gdf_virtual.iterrows():
-        restaurant_id = virtual_row.get('id', f'VR{i:03d}')
+    for i, vr in gdf_virtual.iterrows():
 
-        # 基础特征
         features = {
-            'business_id': restaurant_id,
-            'longitude': df_virtual.iloc[i]['longitude'],
-            'latitude': df_virtual.iloc[i]['latitude'],
-            'price_range': virtual_row.get('price_range', 2),
-            'type': virtual_row.get('type', 'Restaurant'),
+            "business_id": vr.get("id", f"VR{i:03d}"),
+            "longitude": df_virtual.iloc[i]["longitude"],
+            "latitude": df_virtual.iloc[i]["latitude"],
+            "price_range": vr.get("price_range", 2),
+            "type": vr.get("type", "Restaurant"),
         }
 
-        # 将虚拟餐厅snap到walk图的最近节点
-        x_coord = virtual_row.geometry.x
-        y_coord = virtual_row.geometry.y
-
-        # 找到最近的walk节点
+        # walkability
         try:
-            nearest_walk_node = ox.distance.nearest_nodes(G_walk, x_coord, y_coord)
-
-            # 计算10分钟步行等时圈
-            walk_dist_map = nx.single_source_dijkstra_path_length(
-                G_walk, nearest_walk_node, cutoff=WALK_TIME_SECONDS, weight="travel_time"
+            n = ox.distance.nearest_nodes(G_walk, vr.geometry.x, vr.geometry.y)
+            dmap = nx.single_source_dijkstra_path_length(
+                G_walk, n, cutoff=WALK_TIME_SECONDS, weight="travel_time"
             )
+            features["walkability_score"] = len(dmap)
+        except:
+            features["walkability_score"] = 0
 
-            # walkability_score = 等时线内可达的节点数
-            walkability = len(walk_dist_map) if walk_dist_map else 0
-            features['walkability_score'] = int(walkability)
+        # competitor density
+        cats = map_virtual_type_to_categories(vr.get("type", ""), cat_cols)
+        buf = vr.geometry.buffer(WALK_SPEED_KMH * 1000 / 3600 * WALK_TIME_SECONDS)
+        idx = list(gdf_existing.sindex.intersection(buf.bounds))
+        near = gdf_existing.iloc[idx]
+        cnt = 0
+        for _, r in near.iterrows():
+            for c in cats:
+                if r.get(c, 0) == 1:
+                    cnt += 1
+                    break
+        features["competitor_density"] = cnt
 
-        except Exception as e:
-            print(f"    [WARN] walkability计算失败: {e}")
-            features['walkability_score'] = 0
-
-        # 将虚拟餐厅类型映射到类别
-        virtual_type = virtual_row.get('type', '')
-        if pd.isna(virtual_type):
-            virtual_type = ''
-
-        matched_categories = map_virtual_type_to_categories(virtual_type, cat_cols)
-
-        competitor_count = 0
-
-        # 如果有walk等时线数据，计算等时线内的竞争对手
-        if 'walkability_score' in features and features['walkability_score'] > 0:
-            walk_speed_mps = (WALK_SPEED_KMH * 1000) / 3600  # 米/秒
-            max_walk_distance = walk_speed_mps * WALK_TIME_SECONDS  # 最大步行距离
-
-            # 创建等时线缓冲区
-            walk_buffer = virtual_row.geometry.buffer(max_walk_distance)
-
-            # 查询附近的现有餐厅
-            possible_matches_index = list(gdf_existing.sindex.intersection(walk_buffer.bounds))
-            possible_matches = gdf_existing.iloc[possible_matches_index]
-            precise_matches = possible_matches[possible_matches.intersects(walk_buffer)]
-
-            # 计算竞争对手
-            for _, existing_row in precise_matches.iterrows():
-                # 检查是否有匹配的类别
-                for cat in matched_categories:
-                    if cat in existing_row.index and existing_row[cat] == 1:
-                        competitor_count += 1
-                        break
-
-        features['competitor_density'] = competitor_count
-
-        # DRIVE_ACCESSIBILITY_SCORE: 15分钟驾驶可达的凸包面积
-
-        # 将虚拟餐厅snap到drive图的最近节点
+        # drive accessibility
         try:
-            nearest_drive_node = ox.distance.nearest_nodes(G_drive, x_coord, y_coord)
-            sample_edges = list(G_drive.edges(data=True))[:5]
+            n = ox.distance.nearest_nodes(G_drive, vr.geometry.x, vr.geometry.y)
+            dmap = nx.single_source_dijkstra_path_length(
+                G_drive, n, cutoff=DRIVE_TIME_SECONDS, weight="drive_time"
+            )
+            pts = [(G_drive.nodes[k]["x"], G_drive.nodes[k]["y"]) for k in dmap.keys()]
+            features["drive_accessibility_score"] = (
+                MultiPoint(pts).convex_hull.area / 1e6 if len(pts) >= 3 else 0.0
+            )
+        except:
+            features["drive_accessibility_score"] = 0.0
 
-            # 计算15分钟驾驶等时圈
-            try:
-                drive_dist_map = nx.single_source_dijkstra_path_length(
-                    G_drive, nearest_drive_node, cutoff=DRIVE_TIME_SECONDS, weight="drive_time"
-                )
+        # sentiment neighborhood
+        buf = vr.geometry.buffer(500)
+        idx = list(gdf_existing.sindex.intersection(buf.bounds))
+        near = gdf_existing.iloc[idx]
+        features["sentiment_neighborhood_avg"] = (
+            near["avg_sentiment_polarity"].mean()
+            if "avg_sentiment_polarity" in near
+            else df_existing["avg_sentiment_polarity"].mean()
+        )
 
-                if not drive_dist_map:
-                    print("    [WARN] 无可达节点，可能是权重问题或节点孤立")
-                    features['drive_accessibility_score'] = 0.0
-                else:
-                    def convex_hull_area_km2_from_nodes(node_ids, node_x, node_y):
-                        pts = []
-                        for n in node_ids:
-                            x = node_x.get(int(n), None)
-                            y = node_y.get(int(n), None)
-                            if x is None or y is None:
-                                continue
-                            if np.isnan(x) or np.isnan(y):
-                                continue
-                            pts.append((x, y))
+        # other
+        features["betweenness_centrality"] = np.random.uniform(0.002, 0.005)
+        features["distance_to_strip"] = np.random.uniform(500, 5000)
+        features["review_count"] = 0
+        features["is_open"] = 1
+        features["stars"] = np.nan
 
-                        if len(pts) < 3:
-                            return 0.0
-
-                        from shapely.geometry import MultiPoint
-                        geom = MultiPoint(pts).convex_hull
-                        area_m2 = float(geom.area)
-
-                        if area_m2 <= 0:
-                            geom_buffer = MultiPoint(pts).buffer(1.0)
-                            area_m2 = float(geom_buffer.area) if not geom_buffer.is_empty else 0.0
-
-                        return area_m2 / 1e6  # 转换为平方公里
-
-                    # 获取drive图节点坐标
-                    drive_node_x = {}
-                    drive_node_y = {}
-                    for n, data in G_drive.nodes(data=True):
-                        drive_node_x[int(n)] = float(data.get("x", np.nan))
-                        drive_node_y[int(n)] = float(data.get("y", np.nan))
-
-                    # 计算凸包面积
-                    iso_nodes = list(drive_dist_map.keys())
-                    area_km2 = convex_hull_area_km2_from_nodes(iso_nodes, drive_node_x, drive_node_y)
-                    features['drive_accessibility_score'] = float(area_km2)
-
-            except Exception as e:
-                print(f"    [ERROR] Dijkstra计算失败: {e}")
-                features['drive_accessibility_score'] = 0.0
-
-        except Exception as e:
-            print(f"    [ERROR] drive_accessibility计算失败: {e}")
-            features['drive_accessibility_score'] = 0.0
-
-        # 计算情感邻域平均值
-
-        sentiment_radius = 500  # 500米范围
-        sentiment_buffer = virtual_row.geometry.buffer(sentiment_radius)
-
-        possible_matches_index_sentiment = list(gdf_existing.sindex.intersection(sentiment_buffer.bounds))
-        possible_matches_sentiment = gdf_existing.iloc[possible_matches_index_sentiment]
-        precise_matches_sentiment = possible_matches_sentiment[possible_matches_sentiment.intersects(sentiment_buffer)]
-
-        if len(precise_matches_sentiment) > 0 and 'avg_sentiment_polarity' in precise_matches_sentiment.columns:
-            sentiments = precise_matches_sentiment['avg_sentiment_polarity'].dropna()
-            if len(sentiments) > 0:
-                avg_sentiment = float(sentiments.mean())
-            else:
-                avg_sentiment = float(df_existing['avg_sentiment_polarity'].mean())
-        else:
-            avg_sentiment = float(df_existing['avg_sentiment_polarity'].mean())
-
-        features['sentiment_neighborhood_avg'] = avg_sentiment
-
-        # 中心性：靠近市中心的餐厅中心性更高
-        center_point = Point(-75.1652, 39.9526)
-        distance_to_center = virtual_row.geometry.distance(center_point)
-        normalized_distance = min(1.0, distance_to_center / 10000)
-        betweenness = (1 - normalized_distance) * 0.005 + np.random.uniform(0, 0.001)
-        features['betweenness_centrality'] = float(betweenness)
-        features['distance_to_strip'] = float(np.random.uniform(500, 5000))
-
-        # 添加类别特征
-        for cat in cat_cols:
-            if cat in matched_categories:
-                features[cat] = 1
-            else:
-                features[cat] = 0
-
-        # 7. 其他必要字段
-        features['review_count'] = 0  # 虚拟餐厅无评论
-        features['is_open'] = 1  # 假设开业
-        features['stars'] = np.nan  # 虚拟餐厅没有真实评分
+        for c in cat_cols:
+            features[c] = 1 if c in cats else 0
 
         features_list.append(features)
 
     return pd.DataFrame(features_list)
 
 
-def train_model_and_predict(df_existing, df_virtual_features):
-    """训练模型并进行预测"""
-    # 准备训练数据
-    print("[INFO] 准备训练数据")
+# =========================
+# 模型训练与预测
+# =========================
+def train_model_and_predict(df_existing, df_virtual):
 
-    # 排除的列
-    EXCLUDE_COLS = {
-        'business_id', 'stars', 'latitude', 'longitude', 'type', 'review_count'
-    }
+    EXCLUDE = {"business_id", "stars", "latitude", "longitude", "type", "review_count"}
+    FEATURES = [c for c in df_existing.columns if c not in EXCLUDE]
 
-    # 获取特征列
-    FEATURE_COLS = [c for c in df_existing.columns if c not in EXCLUDE_COLS]
-    print(f"[INFO] 特征数量: {len(FEATURE_COLS)}")
-    print(f"[INFO] 前10个特征: {FEATURE_COLS[:10]}")
+    X = df_existing[FEATURES]
+    y = df_existing["stars"]
 
-    # 准备训练数据
-    X_train = df_existing[FEATURE_COLS]
-    y_train = df_existing['stars']
+    for c in FEATURES:
+        if c not in df_virtual.columns:
+            df_virtual[c] = df_existing[c].mean()
 
-    # 确保虚拟餐厅有所有特征列
-    missing_features = []
-    for col in FEATURE_COLS:
-        if col not in df_virtual_features.columns:
-            missing_features.append(col)
-            # 使用训练数据的平均值填充
-            if col in df_existing.columns:
-                mean_val = df_existing[col].mean()
-                df_virtual_features[col] = mean_val
-            else:
-                df_virtual_features[col] = 0
+    model = lgb.LGBMRegressor(
+        objective="regression",
+        n_estimators=200,
+        learning_rate=0.05,
+        num_leaves=31,
+        random_state=42,
+        n_jobs=-1,
+        verbose=-1
+    )
 
-    if missing_features:
-        print(f"[WARN] 虚拟餐厅缺少 {len(missing_features)} 个特征，已用默认值填充")
+    model.fit(X, y)
 
-    # 训练模型
-    print("[INFO] 训练LightGBM模型")
+    preds = np.clip(model.predict(df_virtual[FEATURES]), 1, 5)
 
-    try:
-        model = lgb.LGBMRegressor(
-            objective="regression",
-            n_estimators=200,
-            learning_rate=0.05,
-            num_leaves=31,
-            random_state=42,
-            n_jobs=-1,
-            verbose=-1
-        )
+    result = df_virtual[[
+        "business_id", "longitude", "latitude",
+        "price_range", "type"
+    ]].copy()
 
-        model.fit(X_train, y_train)
-        print("[INFO] 模型训练完成")
+    result["predicted_stars"] = preds
+    result["walkability_score"] = df_virtual["walkability_score"]
+    result["competitor_density"] = df_virtual["competitor_density"]
+    result["drive_accessibility_score"] = df_virtual["drive_accessibility_score"]
+    result["sentiment_neighborhood_avg"] = df_virtual["sentiment_neighborhood_avg"]
 
-        # 特征重要性
-        feature_importance = pd.DataFrame({
-            'feature': FEATURE_COLS,
-            'importance': model.feature_importances_
-        }).sort_values('importance', ascending=False)
-
-        print("\n[INFO] 特征重要性Top 15:")
-        print(feature_importance.head(15).to_string(index=False))
-
-    except Exception as e:
-        print(f"[ERROR] 模型训练失败: {e}")
-        return None, None, None
-
-    # 预测
-    print("[INFO] 进行预测")
-    X_virtual = df_virtual_features[FEATURE_COLS]
-    predictions = model.predict(X_virtual)
-    predictions = np.clip(predictions, 1.0, 5.0)
-
-    # 创建结果
-    results = pd.DataFrame({
-        'business_id': df_virtual_features['business_id'],
-        'longitude': df_virtual_features['longitude'],
-        'latitude': df_virtual_features['latitude'],
-        'price_range': df_virtual_features['price_range'],
-        'type': df_virtual_features['type'],
-        'predicted_stars': predictions,
-        'walkability_score': df_virtual_features['walkability_score'],
-        'competitor_density': df_virtual_features['competitor_density'],
-        'drive_accessibility_score': df_virtual_features['drive_accessibility_score'],
-        'sentiment_neighborhood_avg': df_virtual_features['sentiment_neighborhood_avg'],
-    })
-
-    return results, model, feature_importance
+    return result
 
 
+# =========================
+# main
+# =========================
 def main():
-    """主函数"""
-    print("虚拟餐厅特征计算与预测系统")
 
-    try:
-        # 分析现有餐厅数据
-        print("\n步骤1: 分析现有餐厅数据")
-        df_existing, cat_cols = load_and_prepare_existing_data()
+    print("=== 虚拟餐厅星级预测 ===")
 
-        if df_existing is None:
-            print("[ERROR] 无法加载现有餐厅数据")
-            return
+    df_existing, cat_cols = load_and_prepare_existing_data()
+    df_virtual = load_and_fix_virtual_restaurants()
 
-        # 加载并修复虚拟餐厅数据
-        print("\n步骤2: 加载虚拟餐厅数据")
-        df_virtual = load_and_fix_virtual_restaurants()
+    df_virtual_features = calculate_features_for_virtual_restaurants(
+        df_virtual, df_existing, cat_cols
+    )
 
-        if df_virtual is None or len(df_virtual) == 0:
-            print("[ERROR] 虚拟餐厅数据无效")
-            return
+    df_virtual_features.to_json(
+        OUTPUT_VIRTUAL_JSON, orient="records", lines=True, force_ascii=False
+    )
 
-        # 计算虚拟餐厅特征
-        print("\n步骤3: 计算虚拟餐厅特征")
-        df_virtual_features = calculate_features_for_virtual_restaurants(
-            df_virtual, df_existing, cat_cols
-        )
+    results = train_model_and_predict(df_existing, df_virtual_features)
+    results.to_csv(PREDICTION_OUTPUT, index=False, encoding="utf-8")
 
-        # 保存特征
-        df_virtual_features.to_json(OUTPUT_VIRTUAL_JSON, orient='records',
-                                    lines=True, force_ascii=False)
-        print(f"[INFO] 虚拟餐厅特征已保存到: {OUTPUT_VIRTUAL_JSON}")
-
-        # 训练模型和预测
-        print("\n步骤4: 训练模型和预测")
-        results, model, feature_importance = train_model_and_predict(
-            df_existing, df_virtual_features
-        )
-
-        if results is None:
-            print("[ERROR] 预测失败")
-            return
-
-        # 保存预测结果
-        results.to_csv(PREDICTION_OUTPUT, index=False, encoding='utf-8')
-        print(f"[INFO] 预测结果已保存到: {PREDICTION_OUTPUT}")
-
-        # 显示结果
-        print("最终预测结果")
-        print(results[['business_id', 'type', 'price_range',
-                       'predicted_stars', 'walkability_score',
-                       'competitor_density']].to_string(index=False))
-
-        # 总结
-        print("处理完成!")
-        print(f"1. 现有餐厅数据分析: {len(df_existing)} 条记录")
-        print(f"2. 虚拟餐厅特征计算: {len(df_virtual_features)} 条记录")
-        print(f"3. 预测结果生成: {len(results)} 条记录")
-
-        print(f"\n预测结果统计:")
-        print(f"  平均预测星级: {results['predicted_stars'].mean():.2f}")
-        print(f"  星级范围: {results['predicted_stars'].min():.2f} - {results['predicted_stars'].max():.2f}")
-        print(f"  星级标准差: {results['predicted_stars'].std():.2f}")
-        print(f"\n文件输出:")
-        print(f"  - 虚拟餐厅特征: {OUTPUT_VIRTUAL_JSON}")
-        print(f"  - 预测结果: {PREDICTION_OUTPUT}")
-
-    except Exception as e:
-        print(f"\n[ERROR] 处理过程中发生错误: {e}")
-        import traceback
-        traceback.print_exc()
+    print("完成")
+    print(results[["business_id", "type", "predicted_stars"]])
 
 
 if __name__ == "__main__":
