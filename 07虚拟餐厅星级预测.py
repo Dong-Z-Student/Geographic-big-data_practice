@@ -243,11 +243,6 @@ def train_model_and_predict(df_existing, df_virtual):
     ]].copy()
 
     result["predicted_stars"] = preds
-    result["walkability_score"] = df_virtual["walkability_score"]
-    result["competitor_density"] = df_virtual["competitor_density"]
-    result["drive_accessibility_score"] = df_virtual["drive_accessibility_score"]
-    result["sentiment_neighborhood_avg"] = df_virtual["sentiment_neighborhood_avg"]
-
     return result
 
 
