@@ -7,8 +7,6 @@ from multiprocessing import Pool, cpu_count
 from collections import defaultdict
 from typing import Dict, List, Iterable, Set
 
-import matplotlib.pyplot as plt
-
 
 # ---------------------------
 # 工具函数
@@ -207,7 +205,7 @@ def merge_results(results):
 
 
 # ---------------------------
-# 保存 & 可视化
+# 保存
 # ---------------------------
 def save_city_stats_csv(city_stats: Dict[str, List[int]],
                         global_open: int,
@@ -264,73 +262,6 @@ def save_restaurants_cooccurrence_csv(cooccur: Dict[str, int],
 
     print(f"Restaurants 共现统计已保存：{out_csv}")
 
-
-def plot_restaurants_cooccurrence_graph(cooccur: Dict[str, int],
-                                        target_label: str,
-                                        out_png: str,
-                                        top_n: int = 40):
-    """画 Restaurants 共现强度图。
-    - 圆点=类别
-    - 连线粗细=共现次数（归一化映射到 linewidth）
-    - 圆大小=共现次数（归一化映射到 scatter size）
-    """
-    items = sorted(cooccur.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    if not items:
-        print(f"[WARN] {target_label} 共现为空，跳过绘图：{out_png}")
-        return
-
-    labels = [target_label] + [k for k, _ in items]
-    weights = [v for _, v in items]
-    w_min, w_max = min(weights), max(weights)
-
-    import numpy as np
-    n = len(labels)
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
-
-    pos = {target_label: (0.0, 0.0)}
-    radius = 1.0
-    for i, lab in enumerate(labels[1:], start=1):
-        pos[lab] = (radius * math.cos(angles[i]), radius * math.sin(angles[i]))
-
-    plt.figure(figsize=(10, 10), dpi=200)
-
-    # 画边（线粗细=强度）
-    for (lab, w) in items:
-        if w_max > w_min:
-            lw = 0.8 + 7.2 * (w - w_min) / (w_max - w_min)
-        else:
-            lw = 4.0
-        x0, y0 = pos[target_label]
-        x1, y1 = pos[lab]
-        plt.plot([x0, x1], [y0, y1], linewidth=lw, alpha=0.6)
-
-    # 画节点（圆大小=强度）
-    xs = [pos[l][0] for l in labels]
-    ys = [pos[l][1] for l in labels]
-
-    sizes = [1400]
-    for _, w in items:
-        if w_max > 0:
-            sizes.append(200 + 1800 * (w / w_max))
-        else:
-            sizes.append(400)
-
-    plt.scatter(xs, ys, s=sizes, alpha=0.9)
-
-    # 标注
-    for l in labels:
-        x, y = pos[l]
-        plt.text(x, y, l, fontsize=8, ha='center', va='center')
-
-    plt.title(f"Co-occurrence graph with '{target_label}' (Top {top_n})")
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig(out_png, bbox_inches='tight')
-    plt.close()
-
-    print(f"共现强度图已保存：{out_png}")
-
-
 # ---------------------------
 # main
 # ---------------------------
@@ -368,7 +299,6 @@ def main(file_path: str,
 
     # Restaurants 共现
     save_restaurants_cooccurrence_csv(rest_co, rest_total, out_csv=r'task1/Restaurants共现类别.csv')
-    plot_restaurants_cooccurrence_graph(rest_co, target_label='Restaurants', out_png=r'task1/Restaurants共现强度图.png', top_n=40)
 
     end_time = time.time()
     print(f"\n总运行时间：{end_time - start_time:.2f} 秒")
